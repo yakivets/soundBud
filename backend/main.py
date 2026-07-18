@@ -47,11 +47,10 @@ PUBLIC_URL = os.getenv("SOUNDBUD_URL", "http://localhost:8000").rstrip("/")
 # speaker — saves a minute of waiting and the ElevenLabs credits.
 GENERATE_AUDIO = os.getenv("SOUNDBUD_AUDIO", "1") == "1"
 
-# 30s everywhere: the device streams rather than buffers, so length is not a
-# memory problem, but every extra second is ElevenLabs credits and time the user
-# spends waiting. Claude picks the duration and is not schema-constrained, so
-# this is enforced, not requested.
-MAX_DURATION_MS = 30_000
+# 2 minutes. The device streams rather than buffers, so length costs generation
+# time and ElevenLabs credits, not memory. Claude picks the duration and is not
+# schema-constrained, so this is enforced, not requested.
+MAX_DURATION_MS = 120_000
 MIN_DURATION_MS = 30_000
 
 # 8s of 16kHz mono PCM is ~256KB. 2MB leaves room for a longer clip without
@@ -147,7 +146,7 @@ it as an accent on the music, not the whole brief, and never name the country in
 `say`. A specific request still wins outright: "play some techno" is techno
 everywhere.
 
-`duration_ms` must be 30000.
+`duration_ms` must be 120000.
 
 `screen` must be at most 20 characters — it goes on a 160x80 display. Name the
 MUSIC, never the state: the device already shows whether it is playing, so
@@ -407,13 +406,13 @@ def speak(text: str) -> str:
 
 
 @mcp.tool
-def generate_music(prompt: str, duration_seconds: int = 30,
+def generate_music(prompt: str, duration_seconds: int = 120,
                    instrumental: bool = True) -> str:
     """Generate a music track and return a URL to the mp3.
 
     `prompt` describes the music: genre, mood, instruments, tempo. Be specific —
     "slow lo-fi hip hop, warm rhodes, vinyl crackle" beats "chill music".
-    Takes up to a minute. Duration is fixed at 30 seconds.
+    Takes up to a minute or two. Duration is clamped to 30..120 seconds.
     """
     spec = TrackSpec(prompt=prompt, duration_ms=duration_seconds * 1000,
                      instrumental=instrumental)
