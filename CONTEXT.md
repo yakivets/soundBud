@@ -48,11 +48,17 @@ A second Genesis Mini carries DHT11, LDR and GPS, and POSTs to `/ambient` every
 there is no pairing and either can be off without affecting the other.
 
 There is no "vibe intent". The readings are rendered to plain English ("evening,
-dark, 13°C, cold, humid") and appended to the context Claude already receives, so
-the same `new_track` path covers both features:
+dark, 13°C, cold, humid") and appended to the context Claude receives — but only
+when the request reaches for them:
 
-- "play some drum and bass" — specific, the room gets no vote.
-- "play something" — open-ended, the room decides.
+- "play something", "play some jazz", "surprise me" — readings withheld entirely.
+- "for the current vibe", "match the mood", "fits the weather" — readings sent.
+
+Withheld, not merely discouraged. Telling the model to ignore context in front of
+it does not work: with the readings present, "play something" reliably came back
+as "moody trip hop for a cool London evening" no matter what the prompt said. A
+keyword check on the transcript (`wants_vibe`) decides, so the model cannot use
+what it never sees.
 
 Words rather than raw ADC because the model picks better music from "dim and
 cold" than from a number it has to interpret. Readings older than 10 minutes are

@@ -136,30 +136,20 @@ Choosing the intent is the most important thing you do:
 If genuinely ambiguous between set_volume and modify_track, prefer set_volume:
 it is instant, free, and trivially corrected.
 
-You are told the time of day and, when a sensor board is connected, the light
-level and temperature of the room. Use it to fill in what the user left unsaid —
-never to override them.
+Build the track from what the user actually said, and nothing else. "Play
+something" means pick something good — invent a genre, do not hedge.
 
-- "play some drum and bass" is specific. Give them drum and bass. The room does
-  not get a vote.
-- "play something", "surprise me", "match the mood", "something that fits" is
-  where you lean on it: a dark cold evening wants something different from a
-  bright warm morning.
-- Never read the readings aloud in `say`. "Something warm for the evening" is
-  good; "it is 19°C and dim so here is jazz" is not — nobody wants their
-  thermostat narrating.
+Sometimes you are given a line starting "Right now it is:" with the time, the
+room's light and temperature, the location and the outside weather. It only
+appears when the user asked for it — "for the current vibe", "match the mood",
+"something that fits the weather". When it is there, use it: weather first, since
+rain and fog want something different from clear sun, then light and temperature,
+and let the location colour the genre — flamenco in Spain, garage or trip hop in
+London. When it is absent, do not speculate about the room or the season.
 
-Weather is the strongest signal you get. Rain, fog and overcast skies want
-something different from clear sun — lean into it for open-ended requests.
-Indoor temperature and outdoor temperature are given separately and can disagree;
-that is normal, and the outdoor one usually says more about the mood.
-
-When you are given a location, work out where that is and let the region colour
-open-ended requests: the same "play something" should lean flamenco guitar and
-rumba in Spain, and something more UK — garage, trip hop, folk — in London. Treat
-it as an accent on the music, not the whole brief, and never name the country in
-`say`. A specific request still wins outright: "play some techno" is techno
-everywhere.
+Even when you have it, never read the readings aloud in `say`. "Something warm
+for the evening" is good; "it is 19°C and dim so here is jazz" is not — nobody
+wants their thermostat narrating.
 
 `duration_ms` must be 120000.
 
@@ -353,17 +343,33 @@ def describe_ambient() -> str:
     return ", ".join(bits)
 
 
+# Telling the model to ignore the readings does not work — it uses whatever is in
+# front of it, and "cool London evening" leaks into tracks nobody asked that of.
+# So the readings are withheld unless the request reaches for them.
+VIBE_WORDS = (
+    "vibe", "mood", "atmosphere", "ambience", "ambiance", "weather", "room",
+    "outside", "rain", "sun", "cloud", "fog", "snow", "storm", "temperature",
+    "in here", "right now", "fits", "match", "read the room", "feel",
+)
+
+
+def wants_vibe(utterance: str) -> bool:
+    low = utterance.lower()
+    return any(w in low for w in VIBE_WORDS)
+
+
 def plan_from(utterance: str) -> Plan:
     context = (
         f"Currently playing: {current_track.model_dump_json()}"
         if current_track
         else "Nothing is playing yet."
     )
-    vibe = describe_ambient()
-    context += f"\nRight now it is: {vibe}"
-    # Logged on every decision so it is visible what the model actually saw,
-    # not just what the sensor board last posted.
-    print(f"vibe: {vibe}")
+    if wants_vibe(utterance):
+        vibe = describe_ambient()
+        context += f"\nRight now it is: {vibe}"
+        print(f"vibe (asked for): {vibe}")
+    else:
+        print("vibe: withheld — request did not ask for it")
     response = claude.messages.parse(
         model=MODEL,
         max_tokens=1024,
