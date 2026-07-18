@@ -96,6 +96,9 @@ SPOTIFY_API = "https://api.spotify.com/v1"
 # Refresh token outlives the process; gitignored.
 SPOTIFY_TOKEN_FILE = Path(__file__).parent / ".spotify_token.json"
 _spotify_access: tuple[float, str] = (0.0, "")   # (expires_at, token)
+# Title and artist names last read from Spotify, used to keep them out of
+# generation prompts. See strip_names().
+_last_heard: list[str] = []
 
 claude = anthropic.Anthropic()
 
@@ -135,6 +138,8 @@ class Plan(BaseModel):
     volume: float | None   # absolute target 0..1, only for set_volume
     track: TrackSpec | None  # only for modify_track / new_track
     spotify_query: str | None  # search terms, only for spotify_play
+    # only for transport: what to actually do
+    transport_action: Literal["pause", "resume", "next", "previous"] | None
     say: str               # spoken/《logged》 reply, covers generation latency
     screen: str            # <=20 chars, the display is tiny
 
@@ -152,7 +157,10 @@ Choosing the intent is the most important thing you do:
   "less busy". Return the CURRENT track spec with its prompt adjusted — keep
   everything the user did not ask to change. This regenerates and is slow.
 - new_track: a fresh request unrelated to what's playing. This GENERATES music.
-- transport: "skip", "next", "stop", "pause".
+- transport: playback control — "skip", "next", "stop", "pause", "resume",
+  "go back", "previous". Set `transport_action` to pause, resume, next or
+  previous. "stop" and "pause" both map to pause. This controls whatever is
+  playing, including Spotify.
 - spotify_play: the user named a real, existing song or artist and wants THAT
   recording — "play Bohemian Rhapsody", "put on some Radiohead", "play Blue in
   Green by Bill Evans". Set `spotify_query` to what to search for. Do not use it
@@ -173,6 +181,29 @@ it is instant, free, and trivially corrected.
 
 Build the track from what the user actually said, and nothing else. "Play
 something" means pick something good — invent a genre, do not hedge.
+
+NEVER put a song title, artist name, album or band into `track.prompt`. Two
+reasons, and both matter:
+
+- The generator cannot reproduce a specific recording and will refuse prompts
+  that ask it to. A named track is a rejected request, not a better one.
+- A name carries no musical information. "Jamaican (Bam Bam) by HUGEL" tells it
+  nothing; "latin house around 126bpm, dancehall vocal chops, tropical
+  percussion, filtered piano stabs, warm analogue bass" tells it everything.
+
+So when the user asks for something like what they are hearing, translate the
+track into its musical qualities and describe those. You know how these artists
+and records sound — write down what you know:
+
+  genre and subgenre, tempo, key feel (major/minor, bright/dark),
+  instrumentation, rhythm and groove, production style and era,
+  vocal character if any, energy and mood
+
+The goal is a track in that vein — a new piece a listener would file next to it —
+not a copy of it. Aim for the style, not the song.
+
+You may name the track in `say` and `screen`, since those are only spoken and
+displayed. Just never in `track.prompt`.
 
 Sometimes you are given a line starting "Right now it is:" with the time, the
 room's light and temperature, the location and the outside weather. It only
@@ -432,15 +463,40 @@ def plan_from(utterance: str) -> Plan:
     return response.parsed_output
 
 
+def strip_names(prompt: str) -> str:
+    """Remove the currently-playing title and artist from a generation prompt.
+
+    A backstop for the instruction in SYSTEM. Naming a record asks the generator
+    to reproduce it, which it refuses — and the name was never carrying musical
+    information anyway. What survives is the description, which is the part that
+    actually shapes the output.
+    """
+    heard = _last_heard
+    if not heard:
+        return prompt
+    out = prompt
+    for name in heard:
+        if len(name) < 4:          # too short to match safely
+            continue
+        idx = out.lower().find(name.lower())
+        if idx >= 0:
+            out = (out[:idx] + out[idx + len(name):])
+            print(f"stripped {name!r} from the generation prompt")
+    # Tidy the punctuation the removal leaves behind.
+    out = " ".join(out.replace(" ,", ",").split())
+    return out.strip(" ,-—") or prompt
+
+
 def generate(spec: TrackSpec) -> str:
     """Generate a track, save it, return its filename."""
     started = time.monotonic()
     length_ms = min(MAX_DURATION_MS, max(MIN_DURATION_MS, spec.duration_ms))
+    prompt = strip_names(spec.prompt)
     r = httpx.post(
         f"{ELEVEN}/music",
         headers={"xi-api-key": os.environ["ELEVENLABS_API_KEY"]},
         json={
-            "prompt": spec.prompt,
+            "prompt": prompt,
             "music_length_ms": length_ms,
             "model_id": "music_v1",
             "force_instrumental": spec.instrumental,
@@ -634,6 +690,13 @@ async def utterance(request: Request, volume_now: float | None = None):
     # this device — so the only thing to return is a spoken account of what
     # happened, including when it could not.
     spoken = plan.say
+    if plan.intent == "transport" and plan.transport_action:
+        result = spotify_control(plan.transport_action)
+        print(f"transport {plan.transport_action} -> {result}")
+        # Only speak Spotify's answer when it actually did something; otherwise
+        # keep Claude's reply, since the device controls its own playback.
+        if not result.startswith(("Spotify is not", "No active")):
+            spoken = result
     if plan.intent == "spotify_play" and plan.spotify_query:
         spoken = spotify_play(plan.spotify_query)
         print(f"spotify_play({plan.spotify_query!r}) -> {spoken}")
@@ -704,7 +767,9 @@ def spotify_now_playing() -> str:
     item = (now or {}).get("item")
     if not item:
         return ""
+    global _last_heard
     artists = [a["name"] for a in item.get("artists", [])]
+    _last_heard = [item["name"], *artists]
     bits = f"{item['name']} by {', '.join(artists) or 'unknown'}"
     if item.get("album", {}).get("name"):
         bits += f" (album: {item['album']['name']}"
@@ -721,6 +786,44 @@ def spotify_now_playing() -> str:
             bits += f"; genres: {', '.join(unique)}"
         bits += ")"
     return bits
+
+
+@mcp.tool
+def spotify_control(action: str) -> str:
+    """Control Spotify playback: "pause", "resume", "next" or "previous".
+
+    Acts on the user's own Spotify device. Needs Premium.
+    """
+    token = spotify_token()
+    if not token:
+        return "Spotify is not connected."
+
+    verb, path = {
+        "pause":    ("PUT",  "/me/player/pause"),
+        "stop":     ("PUT",  "/me/player/pause"),
+        "resume":   ("PUT",  "/me/player/play"),
+        "play":     ("PUT",  "/me/player/play"),
+        "next":     ("POST", "/me/player/next"),
+        "skip":     ("POST", "/me/player/next"),
+        "previous": ("POST", "/me/player/previous"),
+    }.get(action.lower(), (None, None))
+    if verb is None:
+        return f"Cannot do {action!r} on Spotify."
+
+    r = httpx.request(verb, f"{SPOTIFY_API}{path}",
+                      headers={"Authorization": f"Bearer {token}"}, timeout=15.0)
+    if r.status_code == 404:
+        return "No active Spotify device to control."
+    if r.status_code == 403:
+        # Also returned when the requested state already holds, e.g. pausing
+        # something that is already paused.
+        return "Spotify would not accept that — it may already be in that state."
+    if r.status_code >= 400:
+        print(f"spotify {path} -> {r.status_code}")
+        return "Spotify did not accept that."
+    return {"pause": "Paused.", "stop": "Paused.", "resume": "Playing again.",
+            "play": "Playing again.", "next": "Skipped.", "skip": "Skipped.",
+            "previous": "Went back."}.get(action.lower(), "Done.")
 
 
 @mcp.tool
@@ -817,19 +920,19 @@ if __name__ == "__main__":
     chill = TrackSpec(prompt="chill lo-fi", duration_ms=30000, instrumental=True)
 
     t, v, gen = apply(
-        Plan(intent="new_track", volume=None, track=chill, spotify_query=None, say="", screen=""),
+        Plan(intent="new_track", volume=None, track=chill, spotify_query=None, transport_action=None, say="", screen=""),
         None, 0.6)
     assert gen and t == chill
 
     warmer = chill.model_copy(update={"prompt": "chill lo-fi, warmer"})
     t2, _, gen2 = apply(
-        Plan(intent="modify_track", volume=None, track=warmer, spotify_query=None, say="", screen=""),
+        Plan(intent="modify_track", volume=None, track=warmer, spotify_query=None, transport_action=None, say="", screen=""),
         t, v)
     assert gen2 and t2.prompt.endswith("warmer")
 
     # volume never generates, and is clamped
     _, v3, gen3 = apply(
-        Plan(intent="set_volume", volume=1.9, track=None, spotify_query=None, say="", screen=""),
+        Plan(intent="set_volume", volume=1.9, track=None, spotify_query=None, transport_action=None, say="", screen=""),
         t2, v)
     assert not gen3 and v3 == 1.0
 
