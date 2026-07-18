@@ -131,7 +131,7 @@ class Plan(BaseModel):
     # "quieter" is ambiguous — playback volume, or calmer music? Deciding this
     # is the whole job. Getting it wrong is what makes the device feel broken.
     intent: Literal["set_volume", "modify_track", "new_track", "transport",
-                    "spotify_play"]
+                    "spotify_play", "answer"]
     volume: float | None   # absolute target 0..1, only for set_volume
     track: TrackSpec | None  # only for modify_track / new_track
     spotify_query: str | None  # search terms, only for spotify_play
@@ -159,8 +159,14 @@ Choosing the intent is the most important thing you do:
   for genres or moods; "play some jazz" is new_track, because they want music
   like that, not one specific recording.
 
+- answer: a QUESTION that needs no action — "what is this song?", "who sings
+  this?", "what's playing?", "what can you do?". Put the reply in `say` and
+  change nothing. A question is never a request to play something: "what is this
+  song" must not restart it.
+
 Deciding between new_track and spotify_play is the second most important call you
-make. A named song or artist is spotify_play. A description is new_track.
+make. A named song or artist is spotify_play. A description is new_track. A
+question about either is answer.
 
 If genuinely ambiguous between set_volume and modify_track, prefer set_volume:
 it is instant, free, and trivially corrected.
@@ -398,7 +404,11 @@ def plan_from(utterance: str) -> Plan:
     if any(w in utterance.lower() for w in
            ("this song", "this track", "playing", "spotify", "like this",
             "what is this", "what's this", "same style", "similar")):
-        heard = spotify_now_playing()
+        try:
+            heard = spotify_now_playing()
+        except Exception as exc:      # never let Spotify break a voice request
+            print(f"spotify lookup failed, continuing without it: {exc}")
+            heard = ""
         if heard:
             context += f"\nOn the user's Spotify right now: {heard}"
             print(f"spotify: {heard}")
@@ -469,16 +479,25 @@ def spotify_token() -> str:
 
 
 def spotify_get(path: str, **params):
-    """GET from the Spotify API. Returns None when not connected or nothing to
-    report — a 204 from currently-playing means simply nothing is playing."""
+    """GET from the Spotify API, returning None rather than raising.
+
+    Everything read from Spotify is enrichment — nice to have, never required to
+    answer the user. A 204 means nothing is playing; 403 means the endpoint is
+    restricted for new apps (Spotify cut several off in Nov 2024). Neither should
+    turn into a 500 on a voice request.
+    """
     token = spotify_token()
     if not token:
         return None
-    r = httpx.get(f"{SPOTIFY_API}{path}", params=params,
-                  headers={"Authorization": f"Bearer {token}"}, timeout=15.0)
-    if r.status_code in (204, 404):
+    try:
+        r = httpx.get(f"{SPOTIFY_API}{path}", params=params,
+                      headers={"Authorization": f"Bearer {token}"}, timeout=15.0)
+    except httpx.HTTPError as exc:
+        print(f"spotify {path} unreachable: {exc}")
         return None
-    r.raise_for_status()
+    if r.status_code >= 400:
+        print(f"spotify {path} -> {r.status_code} (ignored)")
+        return None
     return r.json() if r.content else None
 
 
