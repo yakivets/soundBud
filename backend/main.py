@@ -149,7 +149,12 @@ everywhere.
 
 `duration_ms` must be 30000.
 
-`screen` must be at most 20 characters — it goes on a 160x80 display.
+`screen` must be at most 20 characters — it goes on a 160x80 display. Name the
+MUSIC, never the state: the device already shows whether it is playing, so
+"Now Playing" and "Loading" waste the only line you get. "Dreamy Lo-Fi",
+"Rainy Day Jazz", "Tomorrowland" all tell the user something. Title Case, no
+trailing punctuation. For volume and transport, describing the action is fine —
+"Volume 70%", "Skipped".
 
 `say` is spoken aloud the moment you reply, and it is the only thing the user
 hears until the music is ready. Write it to be heard, not read.
@@ -186,6 +191,9 @@ sentences, spoken like a person, no emoji."""
 
 current_track: TrackSpec | None = None
 volume: float = 0.6
+# Claude's short label for what is playing. Kept so /track can hand back the same
+# title the reply used, instead of a generic one the screen learns nothing from.
+now_playing: str = ""
 
 # Music generation runs here while the spoken reply goes back to the device, so
 # the user hears something within a couple of seconds instead of waiting out the
@@ -455,7 +463,7 @@ async def utterance(request: Request, volume_now: float | None = None):
     """`volume_now` is the device's actual 0..1 level, which the knob can change
     without telling us. Trust it over our own copy, or "turn it down" is computed
     from a stale number."""
-    global current_track, volume
+    global current_track, volume, now_playing
     if volume_now is not None:
         volume = min(1.0, max(0.0, volume_now))
 
@@ -488,6 +496,7 @@ async def utterance(request: Request, volume_now: float | None = None):
     generating = needs_generation and GENERATE_AUDIO
     if generating:
         track = current_track
+        now_playing = plan.screen[:20]
         pending = _pool.submit(lambda: generate(track))
     elif music:
         print(f"music (not generated): {music}")
@@ -566,8 +575,10 @@ def track(request: Request):
     finally:
         pending = None
 
+    # Hand back the label the spoken reply already used, so the screen names the
+    # music rather than restating that something is playing.
     return {"audio_url": f"{str(request.base_url).rstrip('/')}/tracks/{name}",
-            "screen": "Now playing"}
+            "screen": now_playing or "Playing"}
 
 
 if __name__ == "__main__":
