@@ -66,7 +66,8 @@ bool          displayDirty = true;
 unsigned long lastDrawMs   = 0;
 char          screenText[24] = "";   // last `screen` field from the backend
 bool          musicPending = false;  // backend is generating a track for us
-bool          fetchTrack   = false;  // set from the audio callback, acted on in loop()
+bool          fetchTrack   = false;  // set when a stream ends, acted on in loop()
+unsigned long playStartedMs = 0;     // grace period before trusting isRunning()
 
 // This panel is BGR, so swap on the way in.
 uint16_t col(uint8_t r, uint8_t g, uint8_t b) { return tft.color565(b, g, r); }
@@ -249,6 +250,7 @@ void sendAndPlay() {
     appState = SPEAKING;
     displayDirty = true;
     redrawDisplay();
+    playStartedMs = millis();
     audio.connecttohost(speech);
     return;
   }
@@ -298,14 +300,18 @@ void fetchAndPlayTrack() {
   appState = PLAYING;
   displayDirty = true;
   redrawDisplay();
+  playStartedMs = millis();
   audio.connecttohost(url);
 }
 
-// Weak-linked by ESP32-audioI2S; fires when a stream ends. Runs in the audio
-// path, so it only sets a flag — the HTTP call happens back in loop().
-void audio_eof_mp3(const char* info) {
+// End of stream is detected by polling audio.isRunning() in loop() rather than
+// through a callback: ESP32-audioI2S fires audio_eof_mp3 for connecttoFS but
+// audio_eof_stream for connecttohost, and which one exists varies by version.
+// Polling the player's own state works regardless.
+void onPlaybackFinished() {
   if (appState == SPEAKING && musicPending) {
-    fetchTrack = true;      // reply finished; go collect the music
+    Serial.println("Reply finished — collecting track");
+    fetchTrack = true;      // HTTP call happens in loop(), never on the audio path
     return;
   }
   Serial.println("Playback finished");
@@ -364,6 +370,13 @@ void loop() {
   bool pressed  = (btnLast == HIGH && btnNow == LOW);
   bool released = (btnLast == LOW  && btnNow == HIGH);
   btnLast = btnNow;
+
+  // A stream that has stopped running has ended. The grace period covers the
+  // gap between connecttohost() returning and the player actually starting.
+  if ((appState == SPEAKING || appState == PLAYING) && !fetchTrack
+      && millis() - playStartedMs > 1500 && !audio.isRunning()) {
+    onPlaybackFinished();
+  }
 
   // Collect the music once the spoken reply has finished.
   if (fetchTrack) fetchAndPlayTrack();
