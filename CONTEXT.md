@@ -40,6 +40,26 @@ GET /track ─────► blocks on the in-flight generation, usually alread
 The user hears an answer at ~5s instead of nothing until ~15s. `say` was always
 meant to cover generation latency; returning it after generation defeated that.
 
+### Vibe is context, not a mode
+
+A second Genesis Mini carries DHT11, LDR and GPS, and POSTs to `/ambient` every
+60s. It never talks to the speaker — each board knows only the backend URL, so
+there is no pairing and either can be off without affecting the other.
+
+There is no "vibe intent". The readings are rendered to plain English ("evening,
+dark, 13°C, cold, humid") and appended to the context Claude already receives, so
+the same `new_track` path covers both features:
+
+- "play some drum and bass" — specific, the room gets no vote.
+- "play something" — open-ended, the room decides.
+
+Words rather than raw ADC because the model picks better music from "dim and
+cold" than from a number it has to interpret. Readings older than 10 minutes are
+dropped: a stale temperature is a lie about now.
+
+`LIGHT_INVERTED` exists because an LDR divider can be wired either way — flip it
+in software rather than rewiring.
+
 ### Continuous input stays on the device
 
 Volume from the encoder calls `audio.setVolume()` directly and never touches the

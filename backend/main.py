@@ -83,6 +83,17 @@ class TrackSpec(BaseModel):
     instrumental: bool
 
 
+class Ambient(BaseModel):
+    """What the sensor board reports. Every field optional — a half-built board
+    posting only temperature is still useful."""
+    temp_c: float | None = None
+    humidity: float | None = None
+    light: int | None = None       # raw ADC, calibrated here not on the device
+    lat: float | None = None
+    lon: float | None = None
+    has_fix: bool = False
+
+
 class Plan(BaseModel):
     # "quieter" is ambiguous — playback volume, or calmer music? Deciding this
     # is the whole job. Getting it wrong is what makes the device feel broken.
@@ -110,6 +121,19 @@ Choosing the intent is the most important thing you do:
 
 If genuinely ambiguous between set_volume and modify_track, prefer set_volume:
 it is instant, free, and trivially corrected.
+
+You are told the time of day and, when a sensor board is connected, the light
+level and temperature of the room. Use it to fill in what the user left unsaid —
+never to override them.
+
+- "play some drum and bass" is specific. Give them drum and bass. The room does
+  not get a vote.
+- "play something", "surprise me", "match the mood", "something that fits" is
+  where you lean on it: a dark cold evening wants something different from a
+  bright warm morning.
+- Never read the readings aloud in `say`. "Something warm for the evening" is
+  good; "it is 19°C and dim so here is jazz" is not — nobody wants their
+  thermostat narrating.
 
 `duration_ms` must be 30000.
 
@@ -157,6 +181,16 @@ volume: float = 0.6
 _pool = ThreadPoolExecutor(max_workers=1)
 pending: Future | None = None
 
+# Last reading from the sensor board, and when it arrived. Stale readings are
+# worse than none — a temperature from this morning is a lie about right now.
+ambient: Ambient | None = None
+ambient_at: float = 0.0
+AMBIENT_MAX_AGE = 600.0   # 10 minutes; the board posts every 60s
+
+# The LDR divider can be wired either way round. If the device reports "bright"
+# in a dark room, flip this rather than rewiring or reflashing.
+LIGHT_INVERTED = False
+
 
 # ─── steps ──────────────────────────────────────────────────────────────────
 
@@ -172,12 +206,39 @@ def transcribe(wav: bytes) -> str:
     return r.json()["text"].strip()
 
 
+def describe_ambient() -> str:
+    """Render the latest sensor reading as plain English.
+
+    Words, not numbers: the model picks better music from "dim and cold" than
+    from a raw ADC count it has to interpret.
+    """
+    hour = time.localtime().tm_hour
+    part = ("night" if hour < 6 else "morning" if hour < 12
+            else "afternoon" if hour < 18 else "evening")
+    bits = [part]
+
+    if ambient and time.time() - ambient_at < AMBIENT_MAX_AGE:
+        if ambient.light is not None:
+            level = 4095 - ambient.light if LIGHT_INVERTED else ambient.light
+            bits.append("dark" if level < 500 else "dim" if level < 1500
+                        else "bright" if level > 3000 else "normal light")
+        if ambient.temp_c is not None:
+            t = ambient.temp_c
+            bits.append(f"{t:.0f}°C, " + ("cold" if t < 16 else
+                                          "warm" if t > 24 else "mild"))
+        if ambient.humidity is not None and ambient.humidity > 65:
+            bits.append("humid")
+
+    return ", ".join(bits)
+
+
 def plan_from(utterance: str) -> Plan:
     context = (
         f"Currently playing: {current_track.model_dump_json()}"
         if current_track
         else "Nothing is playing yet."
     )
+    context += f"\nRight now it is: {describe_ambient()}"
     response = claude.messages.parse(
         model=MODEL,
         max_tokens=1024,
@@ -335,6 +396,26 @@ async def utterance(request: Request):
         "audio_url": None,
         "volume": round(volume, 2),
     }
+
+
+@app.post("/ambient")
+def post_ambient(reading: Ambient):
+    """Where the sensor board posts. Pydantic validates at the boundary, so a
+    malformed payload gets a 422 instead of poisoning the next prompt."""
+    global ambient, ambient_at
+    ambient, ambient_at = reading, time.time()
+    print(f"ambient: {describe_ambient()}  (raw: {reading.model_dump_json()})")
+    return {"ok": True}
+
+
+@mcp.tool
+def get_vibe() -> str:
+    """The room right now: time of day, light level, temperature, humidity.
+
+    Use it to choose music when the request is open-ended. Returns plain English,
+    or just the time of day if no sensor board is reporting.
+    """
+    return describe_ambient()
 
 
 @app.get("/track")
