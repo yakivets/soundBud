@@ -72,6 +72,28 @@ Consequence: the backend's `volume` and the device's drift apart once the knob i
 touched, so "turn it down" is computed from a stale value. Fix when it matters by
 passing the device's volume up with the next utterance.
 
+### The Hermes agent owns the device-facing API
+
+Decided 2026-07-18. The device points at the agent (`10.50.33.41:8000`), which
+speaks the same contract this backend does — `GET /`, `POST /utterance?volume_now=`,
+`GET /track`. This backend becomes the agent's tool provider, track host, and
+ambient sink:
+
+```
+device ──► agent (Hermes) ──MCP──► this backend ──► ElevenLabs
+sensor node ──────────────────────► /ambient
+```
+
+MCP tools at `/mcp/`: `generate_music`, `get_now_playing`, `get_vibe`.
+
+`plan_from()`, `SYSTEM`, `apply()` and this backend's own `/utterance` are kept
+but no longer on the device path. They still work — `talk.py` exercises them — and
+are the fallback if the agent is unavailable.
+
+`PUBLIC_URL` is auto-detected from the LAN route rather than defaulting to
+localhost: an MCP tool has no request to read a host off, and handing another
+machine a localhost URL fails in a way that looks like the agent's fault.
+
 ### Firmware lives in Axiometa Studio
 
 Studio is the source of truth for both sketches; the copies here are version

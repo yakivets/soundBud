@@ -38,9 +38,24 @@ TRACKS.mkdir(exist_ok=True)
 # that was going to succeed.
 GENERATION_TIMEOUT = 180.0
 
-# How a remote agent should reach us for the mp3s. The MCP tool has no request
-# to read a host off, unlike /utterance. Set this to your LAN address.
-PUBLIC_URL = os.getenv("SOUNDBUD_URL", "http://localhost:8000").rstrip("/")
+# How a remote agent reaches us for the mp3s. An MCP tool has no request to read
+# a host off, unlike /utterance, so this has to be the LAN address — a localhost
+# URL handed to another machine points that machine at itself and fails silently.
+# Detected rather than configured, because forgetting to set it is the single
+# easiest way to break the agent path.
+def _lan_ip() -> str:
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))     # no packets sent; just picks the route
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+PUBLIC_URL = os.getenv("SOUNDBUD_URL", f"http://{_lan_ip()}:8000").rstrip("/")
 
 # Set SOUNDBUD_AUDIO=0 to skip generation and return only the text description
 # in `music`. Useful when testing against a device that has a screen but no
@@ -414,9 +429,25 @@ def generate_music(prompt: str, duration_seconds: int = 120,
     "slow lo-fi hip hop, warm rhodes, vinyl crackle" beats "chill music".
     Takes up to a minute or two. Duration is clamped to 30..120 seconds.
     """
+    global current_track
     spec = TrackSpec(prompt=prompt, duration_ms=duration_seconds * 1000,
                      instrumental=instrumental)
-    return f"{PUBLIC_URL}/tracks/{generate(spec)}"
+    url = f"{PUBLIC_URL}/tracks/{generate(spec)}"
+    # Remembered so a follow-up like "make it calmer" has something to adjust.
+    current_track = spec
+    return url
+
+
+@mcp.tool
+def get_now_playing() -> str:
+    """The prompt behind the track currently playing, or "" if nothing is.
+
+    Call this before a follow-up request like "make it calmer" or "add drums":
+    take this prompt, change only what the user asked for, and pass the whole
+    edited prompt to generate_music. Editing beats starting over — the user
+    expects the same piece adjusted, not a different one.
+    """
+    return current_track.prompt if current_track else ""
 
 
 def apply(plan: Plan, track: TrackSpec | None, vol: float):
