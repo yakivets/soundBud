@@ -47,12 +47,12 @@ PUBLIC_URL = os.getenv("SOUNDBUD_URL", "http://localhost:8000").rstrip("/")
 # speaker — saves a minute of waiting and the ElevenLabs credits.
 GENERATE_AUDIO = os.getenv("SOUNDBUD_AUDIO", "1") == "1"
 
-# The device streams over WiFi rather than buffering the file, so length costs
-# generation time, not memory. 90s is the ceiling because that is roughly where
-# waiting for a track stops feeling responsive. Claude picks the duration and is
-# not schema-constrained, so this is enforced, not requested.
-MAX_DURATION_MS = 90_000
-MIN_DURATION_MS = 30_000  # shorter than this loops back too fast to enjoy
+# 30s everywhere: the device streams rather than buffers, so length is not a
+# memory problem, but every extra second is ElevenLabs credits and time the user
+# spends waiting. Claude picks the duration and is not schema-constrained, so
+# this is enforced, not requested.
+MAX_DURATION_MS = 30_000
+MIN_DURATION_MS = 30_000
 
 # 8s of 16kHz mono PCM is ~256KB. 2MB leaves room for a longer clip without
 # letting an unbounded body read chew all our memory.
@@ -111,13 +111,37 @@ Choosing the intent is the most important thing you do:
 If genuinely ambiguous between set_volume and modify_track, prefer set_volume:
 it is instant, free, and trivially corrected.
 
-`duration_ms` should be 60000 for a normal request. Go longer (up to 90000) only
-if the user asks for something extended, and shorter (min 30000) only if they ask
-for something brief — every second adds generation time they spend waiting.
+`duration_ms` must be 30000.
 
 `screen` must be at most 20 characters — it goes on a 160x80 display.
-`say` is one short friendly sentence; it is played while music generates, so it
-should acknowledge what is coming."""
+
+`say` is spoken aloud the moment you reply, and it is the only thing the user
+hears until the music is ready. Write it to be heard, not read.
+
+For new_track and modify_track, generation takes about ten seconds, so `say` has
+two jobs: name back what they asked for, so they know you understood, and tell
+them a track is being made.
+
+Write a fresh line every time. These are four different shapes, to show the range
+you have — copying one as a template is what makes a device feel canned, and the
+user hears this many times a day:
+
+  "Some jazz, on it. Should be about ten seconds."
+  "Nice — building you something calmer right now."
+  "Techno it is. Hang on while I put this together."
+  "Adding drums. Won't be long."
+
+Notice none of them are built the same way. Some lead with the genre, some with
+the acknowledgement, some mention the wait and some just imply it.
+
+For set_volume and transport nothing is being generated and the change already
+happened, so never ask them to wait. Keep it to an acknowledgement:
+
+  "Turned it down."
+  "Skipping this one."
+
+Do not mention prompts, models, generating, or the API. One or two short
+sentences, spoken like a person, no emoji."""
 
 
 # ─── session state ──────────────────────────────────────────────────────────
@@ -211,13 +235,13 @@ def speak(text: str) -> str:
 
 
 @mcp.tool
-def generate_music(prompt: str, duration_seconds: int = 60,
+def generate_music(prompt: str, duration_seconds: int = 30,
                    instrumental: bool = True) -> str:
     """Generate a music track and return a URL to the mp3.
 
     `prompt` describes the music: genre, mood, instruments, tempo. Be specific —
     "slow lo-fi hip hop, warm rhodes, vinyl crackle" beats "chill music".
-    Takes up to a couple of minutes. Duration is clamped to 30..90 seconds.
+    Takes up to a minute. Duration is fixed at 30 seconds.
     """
     spec = TrackSpec(prompt=prompt, duration_ms=duration_seconds * 1000,
                      instrumental=instrumental)
