@@ -135,6 +135,13 @@ never to override them.
   good; "it is 19°C and dim so here is jazz" is not — nobody wants their
   thermostat narrating.
 
+When you are given a location, work out where that is and let the region colour
+open-ended requests: the same "play something" should lean flamenco guitar and
+rumba in Spain, and something more UK — garage, trip hop, folk — in London. Treat
+it as an accent on the music, not the whole brief, and never name the country in
+`say`. A specific request still wins outright: "play some techno" is techno
+everywhere.
+
 `duration_ms` must be 30000.
 
 `screen` must be at most 20 characters — it goes on a 160x80 display.
@@ -191,6 +198,11 @@ AMBIENT_MAX_AGE = 600.0   # 10 minutes; the board posts every 60s
 # in a dark room, flip this rather than rewiring or reflashing.
 LIGHT_INVERTED = False
 
+# Where the device lives, used when the GPS has no fix — which indoors is
+# always. Set SOUNDBUD_PLACE="Barcelona, Spain" and regional flavour works with
+# no GPS at all. A real fix overrides it.
+HOME_PLACE = os.getenv("SOUNDBUD_PLACE", "")
+
 
 # ─── steps ──────────────────────────────────────────────────────────────────
 
@@ -228,6 +240,14 @@ def describe_ambient() -> str:
                                           "warm" if t > 24 else "mild"))
         if ambient.humidity is not None and ambient.humidity > 65:
             bits.append("humid")
+
+    # Coordinates go in raw: the model knows where 51.5,-0.13 is, so this needs
+    # no geocoding service. A GPS fix wins; otherwise fall back to the configured
+    # home, since indoors there is never a fix.
+    if ambient and ambient.has_fix and ambient.lat is not None:
+        bits.append(f"at {ambient.lat:.2f}, {ambient.lon:.2f}")
+    elif HOME_PLACE:
+        bits.append(f"in {HOME_PLACE}")
 
     return ", ".join(bits)
 
