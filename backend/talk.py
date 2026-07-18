@@ -75,6 +75,8 @@ def main() -> None:
         print(f"  screen : {reply['screen']}")
         print(f"  say    : {reply['say']}")
         print(f"  volume : {reply['volume']}")
+        if reply.get("music"):
+            print(f"  music  : {reply['music']}")
 
         if reply["audio_url"]:
             print(f"  playing: {reply['audio_url']}")

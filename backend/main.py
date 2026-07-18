@@ -41,6 +41,11 @@ GENERATION_TIMEOUT = 180.0
 # to read a host off, unlike /utterance. Set this to your LAN address.
 PUBLIC_URL = os.getenv("SOUNDBUD_URL", "http://localhost:8000").rstrip("/")
 
+# Set SOUNDBUD_AUDIO=0 to skip generation and return only the text description
+# in `music`. Useful when testing against a device that has a screen but no
+# speaker — saves a minute of waiting and the ElevenLabs credits.
+GENERATE_AUDIO = os.getenv("SOUNDBUD_AUDIO", "1") == "1"
+
 claude = anthropic.Anthropic()
 
 # Mounted on the same app so there is one process, one port, one firewall rule.
@@ -219,16 +224,23 @@ async def utterance(request: Request):
 
     current_track, volume, needs_generation = apply(plan, current_track, volume)
 
+    # What the track would be, in words. Useful on the screen while there is no
+    # speaker, and useful for debugging once there is one.
+    music = current_track.prompt if needs_generation else None
+
     audio_url = None
-    if needs_generation:
+    if needs_generation and GENERATE_AUDIO:
         name = generate(current_track)
         # base_url is whatever host the device reached us on, so this is
         # already the right LAN address without configuring it anywhere.
         audio_url = f"{str(request.base_url).rstrip('/')}/tracks/{name}"
+    elif music:
+        print(f"music (not generated): {music}")
 
     return {
         "say": plan.say,
         "screen": plan.screen[:20],
+        "music": music,
         "audio_url": audio_url,
         "volume": round(volume, 2),
     }
