@@ -238,7 +238,11 @@ def plan_from(utterance: str) -> Plan:
         if current_track
         else "Nothing is playing yet."
     )
-    context += f"\nRight now it is: {describe_ambient()}"
+    vibe = describe_ambient()
+    context += f"\nRight now it is: {vibe}"
+    # Logged on every decision so it is visible what the model actually saw,
+    # not just what the sensor board last posted.
+    print(f"vibe: {vibe}")
     response = claude.messages.parse(
         model=MODEL,
         max_tokens=1024,
@@ -338,8 +342,13 @@ def apply(plan: Plan, track: TrackSpec | None, vol: float):
 def health():
     """Open this from a phone browser to prove network + firewall before
     blaming the firmware."""
+    fresh = ambient is not None and time.time() - ambient_at < AMBIENT_MAX_AGE
     return {"ok": True, "playing": current_track.prompt if current_track else None,
-            "volume": volume}
+            "volume": volume,
+            # Open this from a phone to see whether the sensor board is landing.
+            "vibe": describe_ambient(),
+            "sensors": ambient.model_dump() if fresh else None,
+            "sensors_age_s": round(time.time() - ambient_at) if ambient else None}
 
 
 @app.post("/utterance")
