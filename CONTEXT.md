@@ -17,23 +17,16 @@ From the Axiometa catalogue (checked against the live product pages):
 
 | Need | Part | Note |
 |---|---|---|
-| Brain | **PIXIE M1** (ESP32-S3) | WiFi + PSRAM. The only board with confirmed specs. |
+| Brain | **Genesis Mini** (ESP32-S3-Mini-1-N4R2) | 4MB flash, 2MB PSRAM, WiFi. Modules plug into **AX22 ports** — no wiring. |
 | Screen | **IPS LCD 0.96"** | ~160×80. Design for four words, not a dashboard. |
+| Button | **LED Button** | Push-to-talk. Its LED doubles as the recording indicator, free. |
+| Mic | **Digital I2S mic** | Not the kit's analog mic — ADC audio is too noisy for speech-to-text in a loud room. |
 | Amp | **Audio Amplifier (MAX98357A)** | I2S digital amp. |
-| Speaker | — | **Not in the kit. Bring a passive 4–8Ω speaker.** |
-| Mic | **Analog Microphone** in kit | We want a **digital I2S mic** instead — see below. |
+| Speaker | Passive 4–8Ω | |
 | Hand detection | **Distance Sensor (ToF VL53L0X)** | There is no gesture sensor in the catalogue — see below. |
 
-Also available: accelerometers (LSM6DS3TR / ICM-20948 / MPU6050), NeoPixels, vibration
-motor, touchpad (TTP223 — good as the push-to-talk button), light and color sensors.
-
-### Digital mic — bring an INMP441 or ICS-43434
-
-The kit mic is **analog** (ESP32 ADC). Noisy, and speech-to-text degrades badly with it in
-a loud room. A **digital I2S mic** (INMP441 is the common cheap one, ICS-43434 is better)
-plugs into the ESP32-S3's I2S peripheral and gives clean 16kHz mono with no analog stage.
-This is the single most important part to bring — everything downstream depends on the
-speech being transcribable.
+Also in the starter kit if useful: rotary encoder, 5×5 NeoPixel matrix, passive buzzer,
+light sensor, DHT11, IR transceiver. Board also has a STEMMA QT (I2C) connector.
 
 ### There is no gesture sensor
 
@@ -70,8 +63,10 @@ One device. Laptop is the brain, ESP32 is the body.
 
 **Push-to-talk, not wake word.** Hold the touchpad, speak, release. Record into PSRAM, then
 send the whole WAV as one blob. No audio streaming, no voice-activity detection, no wake-word
-model — and it never misfires while someone is talking over you on stage. The ESP32-S3 has
-8MB PSRAM; 10 seconds of 16kHz mono 16-bit is 320KB, which fits with room to spare.
+model — and it never misfires while someone is talking over you on stage. The PIXIE M1 has
+**2MB PSRAM and 4MB flash** (N4R2); 10 seconds of 16kHz mono 16-bit is 320KB, so push-to-talk
+fits comfortably — but the headroom is modest, so don't plan on buffering audio *and* an MP3
+in RAM at the same time.
 
 **Audio playback on the device.** ElevenLabs returns MP3. Use `ESP32-audioI2S`
 (schreibfaul1) — its `connecttohost()` streams an MP3 straight from an HTTP URL to the I2S
@@ -83,6 +78,52 @@ needs a network. Do **not** use venue WiFi — use a **phone hotspot or your own
 router**. Hackathon 2.4GHz is a warzone and captive portals eat demo time. Fallback if the
 network dies: send MP3 bytes over serial into PSRAM and play from memory (~480KB for a 30s
 track, ~5s transfer at 921600 baud — works, just adds latency).
+
+---
+
+## Backend contract
+
+**Plain HTTP, request/response. No websocket for the core loop.** The device always
+initiates, so there is nothing for the backend to push and nothing to keep alive. One
+endpoint does the whole job.
+
+```
+POST /utterance
+  body:     raw 16kHz 16-bit mono WAV (the PSRAM buffer)
+  response: { "say": "here's something chill",
+              "screen": "chill lo-fi",
+              "audio_url": "http://<laptop>:8000/track_07.mp3",
+              "volume": 0.6 }
+```
+
+The device does one thing with that response: show `screen`, set volume, and hand
+`audio_url` to `ESP32-audioI2S`. All the intelligence stays on the laptop, which is also
+the only place session state lives.
+
+Backend pipeline for one request:
+
+```
+WAV ──► speech-to-text ──► Claude(utterance + current TrackSpec)
+                                      │
+                                      ▼ intent
+              set_volume ─────────────┤  no generation, respond immediately
+              transport ──────────────┤  no generation, respond immediately
+              new_track / modify ─────┴─► ElevenLabs /v1/music
+                                              │
+                                          write MP3 into the static dir
+                                              │
+                                          respond with its URL
+```
+
+`GET /track_NN.mp3` is just `http.server` pointed at a folder. Two lines.
+
+**Volume and transport don't generate.** They return in milliseconds because they never
+touch ElevenLabs — which is exactly why the intent classification has to happen before
+anything else, not after.
+
+**The device blocks on this request.** A new_track response won't arrive for however long
+generation takes, so the firmware must keep the screen alive and not trip its HTTP timeout.
+Set the client timeout generously (60s+) and show a working state while waiting.
 
 ---
 
@@ -206,17 +247,20 @@ Nothing here needs writing from scratch.
 
 Each step ends with something demoable. Don't advance until the current one works.
 
-1. **Sound out of the speaker.** ESP32 streams any hardcoded MP3 URL to the MAX98357A.
-   Proves I2S, amp, speaker, and WiFi in one shot — and it's the riskiest hardware path,
-   so do it first.
-2. **Music from a hardcoded prompt.** Laptop → ElevenLabs → local HTTP → device plays it.
+1. **Capture.** Button → I2S mic → PSRAM → level meter on screen. No network, no AI.
+   Proves the mic is actually recording. *(firmware/soundbud)*
+2. **Sound out of the speaker.** Device streams a hardcoded MP3 URL to the MAX98357A.
+   The riskiest remaining hardware path — I2S out, amp, speaker, WiFi all at once.
+3. **Music from a hardcoded prompt.** Laptop → ElevenLabs → local HTTP → device plays it.
    **Time the generation call and write the number down.**
-3. **Voice in.** Button → I2S mic → PSRAM → WAV to laptop → transcript on screen. No AI yet.
-4. **Full loop.** Voice → Claude → ElevenLabs → device plays it. This is the prototype.
-5. **Context.** Session TrackSpec + intent classification. "Make it more energetic" works.
-6. **Gestures.** ToF hover-for-volume, chop-for-next.
-7. **Polish.** Prefetch, crossfade, spoken filler. This is what turns it into a good demo.
-8. *Then:* split into three devices.
+4. **Wire the two halves.** Device POSTs its WAV to `/utterance`, backend transcribes and
+   echoes the text back to the screen. Still no AI, no generation — this proves the
+   transport, which is where the fiddly bugs live.
+5. **Full loop.** Add Claude + ElevenLabs behind `/utterance`. This is the prototype.
+6. **Context.** Session TrackSpec + intent classification. "Make it more energetic" works.
+7. **Gestures.** ToF hover-for-volume, chop-for-next.
+8. **Polish.** Prefetch, crossfade, spoken filler. This is what turns it into a good demo.
+9. *Then:* split into three devices.
 
 ---
 

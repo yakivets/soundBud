@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+httpx
+anthropic
+pydantic
+python-dotenv
+
+# talk.py only — laptop stand-in for the device
+sounddevice
+numpy
+pygame
+fastmcp
