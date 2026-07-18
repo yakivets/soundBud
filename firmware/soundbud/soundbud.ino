@@ -1,6 +1,7 @@
 // soundBud — voice in, generated music out.
 //
-// P2 ST7735 display | P8 MAX98357A amp | P5 PDM mic | P3 button
+//   P1 rotary encoder | P2 ST7735 display | P3 button
+//   P4 NeoPixel 5x5   | P5 PDM mic        | P8 MAX98357A amp
 //
 // Hold the button to record, release to send. Then two things come back:
 //
@@ -13,6 +14,9 @@
 // Press the button during either one to interrupt and talk again; that is how
 // follow-up commands ("make it calmer", "louder") work, and it doubles as echo
 // cancellation since playback stops before the mic opens.
+//
+// The encoder sets volume locally with no network round trip — a knob has to
+// respond instantly, and going through the backend would put seconds on it.
 //
 // Copy secrets.h.example to secrets.h before building.
 // Board: ESP32-S3. Set PSRAM to "OPI PSRAM" and pick a partition scheme that
@@ -29,6 +33,8 @@
 #include <ESP_I2S.h>
 #include <Audio.h>
 #include <ArduinoJson.h>
+#include <RotaryEncoder.h>
+#include <Adafruit_NeoPixel.h>
 
 #define SAMPLE_RATE      16000
 #define MAX_RECORD_SECS  8
@@ -41,12 +47,12 @@
 // P5 — PDM mic: SEL=P5_IO0, CLK=P5_IO2, DATA=P5_IO1
 // P3 — button
 #define BTN_PIN  P3_IO1
-#define MIC_SEL  P5_IO0
-#define MIC_CLK  P5_IO2
-#define MIC_DATA P5_IO1
-#define AMP_BCLK P8_IO1
-#define AMP_LRC  P8_IO2
-#define AMP_DIN  P8_IO0
+// P1 — rotary encoder (its own switch is unused for now)
+#define ENC_BTN  P1_IO0
+#define ENC_CLK  P1_IO1
+#define ENC_DT   P1_IO2
+// P4 — NeoPixel 5x5 matrix
+#define MATRIX_PIN P4_IO1
 
 enum AppState { IDLE, RECORDING, PROCESSING, SPEAKING, PLAYING };
 AppState appState = IDLE;
@@ -61,13 +67,50 @@ File   recFile;                // open only while recording
 size_t recSamples = 0;
 bool   micActive  = false;
 
+char          screenText[24] = "";   // last `screen` field from the backend
+unsigned long playStartedMs  = 0;    // grace period before trusting isRunning()
+bool          musicPending  = false; // backend is generating a track for us
+bool          fetchTrack    = false; // set when a stream ends, acted on in loop()
 bool          btnLast      = HIGH;
 bool          displayDirty = true;
 unsigned long lastDrawMs   = 0;
-char          screenText[24] = "";   // last `screen` field from the backend
-bool          musicPending = false;  // backend is generating a track for us
-bool          fetchTrack   = false;  // set when a stream ends, acted on in loop()
-unsigned long playStartedMs = 0;     // grace period before trusting isRunning()
+
+RotaryEncoder encoder(ENC_CLK, ENC_DT, RotaryEncoder::LatchMode::TWO03);
+Adafruit_NeoPixel strip(25, MATRIX_PIN, NEO_GRB + NEO_KHZ800);
+int           currentVolume   = 16;  // 0..21, the ESP32-audioI2S scale
+long          encLastPos      = 0;
+unsigned long volChangedMs    = 0;
+bool          matrixDirty     = false;
+int           matrixLastLevel = -1;
+
+// ── volume and matrix ───────────────────────────────────────────────────────
+
+void setVolume(int v) {
+  v = max(0, min(21, v));
+  currentVolume = v;
+  audio.setVolume(v);
+  volChangedMs = millis();
+  matrixDirty  = true;
+}
+
+void updateMatrix() {
+  // 0..21 mapped onto 25 pixels: green low, amber mid, red high.
+  int lit = (currentVolume * 25 + 10) / 21;
+  // NeoPixel writes disable interrupts, so redrawing every loop audibly
+  // glitches the I2S stream. Only push when the level actually moved.
+  if (lit == matrixLastLevel) return;
+  matrixLastLevel = lit;
+  for (int i = 0; i < 25; i++) {
+    if (i < lit) {
+      if      (i < 9)  strip.setPixelColor(i, strip.Color(0,   180,   0));
+      else if (i < 17) strip.setPixelColor(i, strip.Color(180, 100,   0));
+      else             strip.setPixelColor(i, strip.Color(180,   0,   0));
+    } else {
+      strip.setPixelColor(i, 0);
+    }
+  }
+  strip.show();
+}
 
 // This panel is BGR, so swap on the way in.
 uint16_t col(uint8_t r, uint8_t g, uint8_t b) { return tft.color565(b, g, r); }
@@ -98,23 +141,23 @@ void redrawDisplay() {
       canvas.setCursor(16, 38); canvas.print("audio...");
       break;
     case SPEAKING:
-      canvas.setTextColor(col(120, 180, 255));
+      canvas.setTextColor(col(100, 180, 255));
       canvas.setTextSize(2);
-      canvas.setCursor(8, 20);
-      canvas.print(screenText[0] ? screenText : "...");
+      canvas.setCursor(4, 10);
+      canvas.print(screenText[0] ? screenText : "Speaking");
       canvas.setTextSize(1);
-      canvas.setTextColor(col(90, 90, 90));
-      canvas.setCursor(8, 62);  canvas.print("Making your track");
+      canvas.setTextColor(col(150, 150, 150));
+      canvas.setCursor(16, 62); canvas.print("Making your track");
       break;
     case PLAYING:
       canvas.setTextColor(col(50, 220, 100));
       canvas.setTextSize(2);
-      canvas.setCursor(8, 20);
+      canvas.setCursor(4, 10);
       // The backend sizes `screen` to 20 chars for exactly this.
       canvas.print(screenText[0] ? screenText : "Playing");
       canvas.setTextSize(1);
-      canvas.setTextColor(col(90, 90, 90));
-      canvas.setCursor(8, 62);  canvas.print("Hold to interrupt");
+      canvas.setTextColor(col(150, 150, 150));
+      canvas.setCursor(10, 62); canvas.print("Hold to interrupt");
       break;
   }
   tft.drawRGBBitmap(0, 0, canvas.getBuffer(), 160, 80);
@@ -151,9 +194,9 @@ void patchWavSizes(File& f, uint32_t numSamples) {
 
 bool startMic() {
   if (micActive) return true;
-  pinMode(MIC_SEL, OUTPUT);
-  digitalWrite(MIC_SEL, LOW);          // SEL low → left/mono slot
-  i2s.setPinsPdmRx(MIC_CLK, MIC_DATA);   // CLK, DATA
+  pinMode(P5_IO0, OUTPUT);
+  digitalWrite(P5_IO0, LOW);          // SEL low → left/mono slot
+  i2s.setPinsPdmRx(P5_IO2, P5_IO1);   // CLK, DATA
   if (!i2s.begin(I2S_MODE_PDM_RX, SAMPLE_RATE,
                  I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
     Serial.println("Mic init failed");
@@ -221,6 +264,7 @@ void sendAndPlay() {
 
   if (code != 200) {
     http.end();
+    Serial.printf("API error %d\n", code);
     appState = IDLE; displayDirty = true; return;
   }
 
@@ -235,73 +279,30 @@ void sendAndPlay() {
     appState = IDLE; displayDirty = true; return;
   }
 
-  const char* speech = doc["speech_url"] | "";
-  const char* scr    = doc["screen"]     | "";
+  const char* speechUrl = doc["speech_url"] | "";
+  const char* scr       = doc["screen"]     | "";
   musicPending = doc["music_pending"] | false;
-  int vol = (int)((doc["volume"] | 0.6f) * 21);   // backend sends 0..1, library wants 0..21
   snprintf(screenText, sizeof(screenText), "%s", scr);
-  Serial.printf("screen: %s  volume: %d  pending: %d\n", scr, vol, musicPending);
-
-  audio.setVolume(vol);
+  setVolume((int)((doc["volume"] | 0.6f) * 21));   // backend sends 0..1
+  encLastPos = encoder.getPosition();              // keep the knob in step
+  Serial.printf("speech: %s  pending: %d  screen: %s  vol: %d\n",
+                speechUrl, musicPending, screenText, currentVolume);
 
   // The spoken reply comes back in a couple of seconds while the music is still
   // generating, so the user hears an answer instead of waiting in silence.
-  if (strlen(speech) > 0) {
+  if (strlen(speechUrl) > 0) {
     appState = SPEAKING;
     displayDirty = true;
     redrawDisplay();
     playStartedMs = millis();
-    audio.connecttohost(speech);
-    return;
+    audio.connecttohost(speechUrl);
+  } else if (musicPending) {
+    fetchTrack = true;          // TTS failed, but the track is still coming
+    appState = SPEAKING;
+    displayDirty = true;
+  } else {
+    appState = IDLE; displayDirty = true;
   }
-
-  // No voice (TTS failed, or a volume/transport command with nothing to say).
-  if (musicPending) { fetchTrack = true; return; }
-  appState = IDLE; displayDirty = true;
-}
-
-// Ask the backend for the track it has been generating since the POST. Blocks
-// until it is ready, which by now is usually immediate.
-void fetchAndPlayTrack() {
-  fetchTrack = false;
-  musicPending = false;
-
-  appState = PROCESSING;
-  redrawDisplay();
-
-  HTTPClient http;
-  WiFiClient client;
-  http.begin(client, String(BACKEND_URL) + "/track");
-  http.setTimeout(180000);
-
-  int code = http.GET();
-  if (code != 200) {
-    http.end();
-    Serial.printf("GET /track -> HTTP %d\n", code);
-    appState = IDLE; displayDirty = true; return;
-  }
-
-  String body = http.getString();
-  http.end();
-
-  JsonDocument doc;
-  if (deserializeJson(doc, body)) {
-    Serial.println("track JSON parse error");
-    appState = IDLE; displayDirty = true; return;
-  }
-
-  const char* url = doc["audio_url"] | "";
-  const char* scr = doc["screen"]    | "";
-  if (scr[0]) snprintf(screenText, sizeof(screenText), "%s", scr);
-  Serial.printf("track: %s\n", url);
-
-  if (strlen(url) == 0) { appState = IDLE; displayDirty = true; return; }
-
-  appState = PLAYING;
-  displayDirty = true;
-  redrawDisplay();
-  playStartedMs = millis();
-  audio.connecttohost(url);
 }
 
 // End of stream is detected by polling audio.isRunning() in loop() rather than
@@ -317,6 +318,52 @@ void onPlaybackFinished() {
   Serial.println("Playback finished");
   appState = IDLE;
   displayDirty = true;
+}
+
+// Ask the backend for the track it has been generating since the POST. Blocks
+// until it is ready, which by now is usually immediate.
+void fetchAndPlayTrack() {
+  fetchTrack   = false;
+  musicPending = false;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi lost — cannot fetch track");
+    appState = IDLE; displayDirty = true; return;
+  }
+
+  HTTPClient http;
+  WiFiClient client;
+  http.begin(client, String(BACKEND_URL) + "/track");
+  http.setTimeout(180000);
+  int code = http.GET();
+  Serial.printf("GET /track -> HTTP %d\n", code);
+
+  if (code != 200) {
+    http.end();
+    appState = IDLE; displayDirty = true; return;
+  }
+
+  String body = http.getString();
+  http.end();
+
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) {
+    Serial.println("track JSON parse error");
+    appState = IDLE; displayDirty = true; return;
+  }
+
+  const char* url = doc["audio_url"] | "";
+  const char* scr = doc["screen"]    | "";
+  if (scr[0]) snprintf(screenText, sizeof(screenText), "%s", scr);
+
+  if (strlen(url) == 0) { appState = IDLE; displayDirty = true; return; }
+
+  Serial.printf("Streaming track: %s\n", url);
+  appState = PLAYING;
+  displayDirty = true;
+  redrawDisplay();
+  playStartedMs = millis();
+  audio.connecttohost(url);
 }
 
 // ── setup ───────────────────────────────────────────────────────────────────
@@ -348,7 +395,16 @@ void setup() {
   // -10025 here means the partition scheme has no SPIFFS partition to format.
   if (!SPIFFS.begin(true)) Serial.println("SPIFFS mount failed");
 
-  audio.setPinout(AMP_BCLK, AMP_LRC, AMP_DIN);
+  audio.setPinout(P8_IO1, P8_IO2, P8_IO0);
+
+  strip.begin();
+  strip.setBrightness(25);   // these are far brighter than needed indoors
+  strip.show();
+
+  pinMode(ENC_BTN, INPUT);   // encoder's own switch, unused for now
+
+  setVolume(16);
+  encLastPos = encoder.getPosition();
 
   appState = IDLE;
   displayDirty = true;
@@ -360,16 +416,29 @@ void setup() {
 void loop() {
   audio.loop();   // must run every pass while audio is active
 
+  // Volume is local and instant — deliberately never touches the backend, and
+  // never changes appState, so turning it cannot interrupt playback.
+  encoder.tick();
+  long encPos = encoder.getPosition();
+  if (encPos != encLastPos) {
+    setVolume(currentVolume + (int)(encPos - encLastPos));
+    encLastPos = encPos;
+  }
+
+  if (matrixDirty) {
+    updateMatrix();
+    matrixDirty = false;
+  } else if (matrixLastLevel != 0 && millis() - volChangedMs > 3000) {
+    for (int i = 0; i < 25; i++) strip.setPixelColor(i, 0);
+    strip.show();
+    matrixLastLevel = 0;
+  }
+
   if (displayDirty && millis() - lastDrawMs >= 33) {   // ~30fps ceiling
     redrawDisplay();
     lastDrawMs = millis();
     displayDirty = false;
   }
-
-  bool btnNow   = digitalRead(BTN_PIN);
-  bool pressed  = (btnLast == HIGH && btnNow == LOW);
-  bool released = (btnLast == LOW  && btnNow == HIGH);
-  btnLast = btnNow;
 
   // A stream that has stopped running has ended. The grace period covers the
   // gap between connecttohost() returning and the player actually starting.
@@ -380,6 +449,11 @@ void loop() {
 
   // Collect the music once the spoken reply has finished.
   if (fetchTrack) fetchAndPlayTrack();
+
+  bool btnNow   = digitalRead(BTN_PIN);
+  bool pressed  = (btnLast == HIGH && btnNow == LOW);
+  bool released = (btnLast == LOW  && btnNow == HIGH);
+  btnLast = btnNow;
 
   // PLAYING and SPEAKING are included so a follow-up command can interrupt.
   if (pressed && (appState == IDLE || appState == PLAYING || appState == SPEAKING)) {

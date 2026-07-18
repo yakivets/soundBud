@@ -40,6 +40,17 @@ GET /track ─────► blocks on the in-flight generation, usually alread
 The user hears an answer at ~5s instead of nothing until ~15s. `say` was always
 meant to cover generation latency; returning it after generation defeated that.
 
+### Continuous input stays on the device
+
+Volume from the encoder calls `audio.setVolume()` directly and never touches the
+backend. A knob has to answer instantly; routing it through `/utterance` would put
+five seconds on every turn. Voice is the slow, semantic path — it picks the song.
+The knob is the fast, continuous one. Keep them apart.
+
+Consequence: the backend's `volume` and the device's drift apart once the knob is
+touched, so "turn it down" is computed from a stale value. Fix when it matters by
+passing the device's volume up with the next utterance.
+
 ### Two facts worth not rediscovering
 
 - **ElevenLabs rejects `seed` when `prompt` is set.** There is no continuity knob, so
@@ -52,6 +63,17 @@ meant to cover generation latency; returning it after generation defeated that.
 ## Hardware
 
 From the Axiometa catalogue (checked against the live product pages):
+
+Current port assignment on the built device:
+
+| Port | Module |
+|---|---|
+| P1 | Rotary encoder — volume |
+| P2 | IPS LCD 0.96" (ST7735, 160×80) |
+| P3 | Button — push to talk |
+| P4 | NeoPixel 5×5 matrix — volume level |
+| P5 | PDM mic |
+| P8 | MAX98357A amp → speaker |
 
 | Need | Part | Note |
 |---|---|---|
