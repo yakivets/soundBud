@@ -14,3 +14,6 @@ firmware/**/secrets.h
 
 # generated CAD output
 cad/out/
+
+# Spotify OAuth token (refresh token) — never commit
+backend/.spotify_token.json

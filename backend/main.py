@@ -9,8 +9,10 @@ Run:  uvicorn main:app --host 0.0.0.0 --port 8000
       (0.0.0.0, not 127.0.0.1 — the device is a different machine)
 """
 
+import json
 import os
 import time
+from urllib.parse import urlencode
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal
@@ -19,6 +21,7 @@ import anthropic
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastmcp import FastMCP
 from pydantic import BaseModel
@@ -78,6 +81,22 @@ WAV_HEADER_BYTES = 44
 VOICE_ID = os.getenv("SOUNDBUD_VOICE", "21m00Tcm4TlvDq8ikWAM")
 TTS_MODEL = "eleven_flash_v2_5"
 
+# ─── Spotify ────────────────────────────────────────────────────────────────
+# Read-only use (what is playing) works on a free account. Starting playback
+# needs Premium and an already-running Spotify client to target — there is no
+# DRM-free stream, so Spotify audio can never come out of our own speaker.
+SPOTIFY_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
+SPOTIFY_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
+# Spotify only permits plain http for the literal loopback address.
+SPOTIFY_REDIRECT = os.getenv("SPOTIFY_REDIRECT_URI",
+                             "http://127.0.0.1:8000/spotify/callback")
+SPOTIFY_SCOPES = ("user-read-currently-playing user-read-playback-state "
+                  "user-modify-playback-state")
+SPOTIFY_API = "https://api.spotify.com/v1"
+# Refresh token outlives the process; gitignored.
+SPOTIFY_TOKEN_FILE = Path(__file__).parent / ".spotify_token.json"
+_spotify_access: tuple[float, str] = (0.0, "")   # (expires_at, token)
+
 claude = anthropic.Anthropic()
 
 # Mounted on the same app so there is one process, one port, one firewall rule.
@@ -111,9 +130,11 @@ class Ambient(BaseModel):
 class Plan(BaseModel):
     # "quieter" is ambiguous — playback volume, or calmer music? Deciding this
     # is the whole job. Getting it wrong is what makes the device feel broken.
-    intent: Literal["set_volume", "modify_track", "new_track", "transport"]
+    intent: Literal["set_volume", "modify_track", "new_track", "transport",
+                    "spotify_play"]
     volume: float | None   # absolute target 0..1, only for set_volume
     track: TrackSpec | None  # only for modify_track / new_track
+    spotify_query: str | None  # search terms, only for spotify_play
     say: str               # spoken/《logged》 reply, covers generation latency
     screen: str            # <=20 chars, the display is tiny
 
@@ -130,8 +151,16 @@ Choosing the intent is the most important thing you do:
   is already playing. "calmer", "softer", "more energetic", "add drums",
   "less busy". Return the CURRENT track spec with its prompt adjusted — keep
   everything the user did not ask to change. This regenerates and is slow.
-- new_track: a fresh request unrelated to what's playing.
+- new_track: a fresh request unrelated to what's playing. This GENERATES music.
 - transport: "skip", "next", "stop", "pause".
+- spotify_play: the user named a real, existing song or artist and wants THAT
+  recording — "play Bohemian Rhapsody", "put on some Radiohead", "play Blue in
+  Green by Bill Evans". Set `spotify_query` to what to search for. Do not use it
+  for genres or moods; "play some jazz" is new_track, because they want music
+  like that, not one specific recording.
+
+Deciding between new_track and spotify_play is the second most important call you
+make. A named song or artist is spotify_play. A description is new_track.
 
 If genuinely ambiguous between set_volume and modify_track, prefer set_volume:
 it is instant, free, and trivially corrected.
@@ -364,6 +393,16 @@ def plan_from(utterance: str) -> Plan:
         if current_track
         else "Nothing is playing yet."
     )
+    # "make something like this" needs to know what "this" is. Fetched only when
+    # referenced, same reasoning as the ambient readings.
+    if any(w in utterance.lower() for w in
+           ("this song", "this track", "playing", "spotify", "like this",
+            "what is this", "what's this", "same style", "similar")):
+        heard = spotify_now_playing()
+        if heard:
+            context += f"\nOn the user's Spotify right now: {heard}"
+            print(f"spotify: {heard}")
+
     if wants_vibe(utterance):
         vibe = describe_ambient()
         context += f"\nRight now it is: {vibe}"
@@ -406,6 +445,41 @@ def generate(spec: TrackSpec) -> str:
     print(f"generated {name} in {time.monotonic() - started:.1f}s "
           f"({len(r.content) // 1024}KB) :: {spec.prompt}")
     return name
+
+
+def spotify_token() -> str:
+    """A valid access token, refreshed on demand. "" if not connected yet."""
+    global _spotify_access
+    expires, token = _spotify_access
+    if token and time.time() < expires:
+        return token
+    if not (SPOTIFY_ID and SPOTIFY_SECRET and SPOTIFY_TOKEN_FILE.exists()):
+        return ""
+    refresh = json.loads(SPOTIFY_TOKEN_FILE.read_text())["refresh_token"]
+    r = httpx.post("https://accounts.spotify.com/api/token",
+                   data={"grant_type": "refresh_token", "refresh_token": refresh},
+                   auth=(SPOTIFY_ID, SPOTIFY_SECRET), timeout=15.0)
+    r.raise_for_status()
+    body = r.json()
+    # Refresh tokens are usually reused, but Spotify may rotate them.
+    if body.get("refresh_token"):
+        SPOTIFY_TOKEN_FILE.write_text(json.dumps({"refresh_token": body["refresh_token"]}))
+    _spotify_access = (time.time() + body["expires_in"] - 60, body["access_token"])
+    return _spotify_access[1]
+
+
+def spotify_get(path: str, **params):
+    """GET from the Spotify API. Returns None when not connected or nothing to
+    report — a 204 from currently-playing means simply nothing is playing."""
+    token = spotify_token()
+    if not token:
+        return None
+    r = httpx.get(f"{SPOTIFY_API}{path}", params=params,
+                  headers={"Authorization": f"Bearer {token}"}, timeout=15.0)
+    if r.status_code in (204, 404):
+        return None
+    r.raise_for_status()
+    return r.json() if r.content else None
 
 
 def speak(text: str) -> str:
@@ -467,8 +541,8 @@ def apply(plan: Plan, track: TrackSpec | None, vol: float):
         vol = min(1.0, max(0.0, plan.volume if plan.volume is not None else vol))
         return track, vol, False
 
-    if plan.intent == "transport":
-        return track, vol, False
+    if plan.intent in ("transport", "spotify_play"):
+        return track, vol, False   # Spotify plays on the user's own device
 
     if plan.track is None:
         return track, vol, False  # asked to generate but gave no spec
@@ -537,15 +611,23 @@ async def utterance(request: Request, volume_now: float | None = None):
     elif music:
         print(f"music (not generated): {music}")
 
+    # Spotify plays on the user's own phone or laptop — there is no stream for
+    # this device — so the only thing to return is a spoken account of what
+    # happened, including when it could not.
+    spoken = plan.say
+    if plan.intent == "spotify_play" and plan.spotify_query:
+        spoken = spotify_play(plan.spotify_query)
+        print(f"spotify_play({plan.spotify_query!r}) -> {spoken}")
+
     speech_url = None
     try:
-        speech_url = f"{base}/tracks/{speak(plan.say)}"
+        speech_url = f"{base}/tracks/{speak(spoken)}"
     except httpx.HTTPError as exc:
         # Losing the voice is survivable — the screen still says what happened.
         print(f"tts failed: {exc}")
 
     return {
-        "say": plan.say,
+        "say": spoken,
         "screen": plan.screen[:20],
         "music": music,
         "speech_url": speech_url,
@@ -557,6 +639,100 @@ async def utterance(request: Request, volume_now: float | None = None):
         # of what the device already has, and applying it would stamp on the knob.
         "set_volume": plan.intent == "set_volume",
     }
+
+
+@app.get("/spotify/login")
+def spotify_login():
+    """Open this in a browser once to connect an account. Redirects to Spotify,
+    which sends the user back to /spotify/callback with a code."""
+    if not SPOTIFY_ID:
+        raise HTTPException(500, "SPOTIFY_CLIENT_ID not set in .env")
+    q = urlencode({"client_id": SPOTIFY_ID, "response_type": "code",
+                   "redirect_uri": SPOTIFY_REDIRECT, "scope": SPOTIFY_SCOPES})
+    return RedirectResponse(f"https://accounts.spotify.com/authorize?{q}")
+
+
+@app.get("/spotify/callback")
+def spotify_callback(code: str = "", error: str = ""):
+    if error:
+        raise HTTPException(400, f"Spotify refused: {error}")
+    r = httpx.post("https://accounts.spotify.com/api/token",
+                   data={"grant_type": "authorization_code", "code": code,
+                         "redirect_uri": SPOTIFY_REDIRECT},
+                   auth=(SPOTIFY_ID, SPOTIFY_SECRET), timeout=15.0)
+    r.raise_for_status()
+    # Only the refresh token is worth keeping; access tokens last an hour.
+    SPOTIFY_TOKEN_FILE.write_text(json.dumps({"refresh_token": r.json()["refresh_token"]}))
+    print(f"spotify: connected, refresh token saved to {SPOTIFY_TOKEN_FILE.name}")
+    return {"ok": True, "message": "Spotify connected. You can close this tab."}
+
+
+@mcp.tool
+def spotify_now_playing() -> str:
+    """What is playing on the user's Spotify right now, with the artist's genres.
+
+    Returns something like:
+        "Bohemian Rhapsody by Queen (album: A Night at the Opera;
+         genres: glam rock, classic rock)"
+
+    Use it for "what's this?", and as the seed for "make me something like this"
+    — you already know how these artists sound, so write an ElevenLabs prompt
+    describing that style rather than quoting the genres back.
+
+    Returns "" if nothing is playing or Spotify is not connected.
+    """
+    now = spotify_get("/me/player/currently-playing")
+    item = (now or {}).get("item")
+    if not item:
+        return ""
+    artists = [a["name"] for a in item.get("artists", [])]
+    bits = f"{item['name']} by {', '.join(artists) or 'unknown'}"
+    if item.get("album", {}).get("name"):
+        bits += f" (album: {item['album']['name']}"
+        # Genres live on the artist, not the track. /audio-features is dead since
+        # Nov 2024, so this is the only style signal the API still gives us.
+        ids = [a["id"] for a in item.get("artists", []) if a.get("id")]
+        genres: list[str] = []
+        if ids:
+            info = spotify_get("/artists", ids=",".join(ids[:5])) or {}
+            for a in info.get("artists", []):
+                genres += a.get("genres", [])
+        if genres:
+            unique = list(dict.fromkeys(genres))[:6]
+            bits += f"; genres: {', '.join(unique)}"
+        bits += ")"
+    return bits
+
+
+@mcp.tool
+def spotify_play(query: str) -> str:
+    """Search Spotify and start playing the best match. Needs Premium.
+
+    IMPORTANT: this plays on the user's own Spotify device — their phone or
+    laptop — not on this speaker. Spotify has no stream we can play. Say so if
+    nothing comes out of the speaker.
+    """
+    token = spotify_token()
+    if not token:
+        return "Spotify is not connected. Open /spotify/login in a browser first."
+
+    found = spotify_get("/search", q=query, type="track", limit=1) or {}
+    items = found.get("tracks", {}).get("items", [])
+    if not items:
+        return f"Nothing on Spotify matched {query!r}."
+    track = items[0]
+    label = f"{track['name']} by {', '.join(a['name'] for a in track['artists'])}"
+
+    r = httpx.put(f"{SPOTIFY_API}/me/player/play",
+                  json={"uris": [track["uri"]]},
+                  headers={"Authorization": f"Bearer {token}"}, timeout=15.0)
+    if r.status_code == 404:
+        return (f"Found {label}, but no active Spotify device. Open Spotify on a "
+                "phone or laptop and press play once, then ask again.")
+    if r.status_code == 403:
+        return f"Found {label}, but playback control needs Spotify Premium."
+    r.raise_for_status()
+    return f"Playing {label} on your Spotify device."
 
 
 @app.post("/ambient")
@@ -622,19 +798,19 @@ if __name__ == "__main__":
     chill = TrackSpec(prompt="chill lo-fi", duration_ms=30000, instrumental=True)
 
     t, v, gen = apply(
-        Plan(intent="new_track", volume=None, track=chill, say="", screen=""),
+        Plan(intent="new_track", volume=None, track=chill, spotify_query=None, say="", screen=""),
         None, 0.6)
     assert gen and t == chill
 
     warmer = chill.model_copy(update={"prompt": "chill lo-fi, warmer"})
     t2, _, gen2 = apply(
-        Plan(intent="modify_track", volume=None, track=warmer, say="", screen=""),
+        Plan(intent="modify_track", volume=None, track=warmer, spotify_query=None, say="", screen=""),
         t, v)
     assert gen2 and t2.prompt.endswith("warmer")
 
     # volume never generates, and is clamped
     _, v3, gen3 = apply(
-        Plan(intent="set_volume", volume=1.9, track=None, say="", screen=""),
+        Plan(intent="set_volume", volume=1.9, track=None, spotify_query=None, say="", screen=""),
         t2, v)
     assert not gen3 and v3 == 1.0
 
