@@ -18,7 +18,8 @@ no second firmware, no pairing, and no device-to-device protocol.
 |---|---|
 | `backend/main.py` | FastAPI. `POST /utterance` takes a raw WAV and returns a spoken reply; `GET /track` hands over the music once it is ready. |
 | `backend/talk.py` | Laptop stand-in for the device — same contract, useful when the hardware is not on the bench. |
-| `firmware/soundbud/` | Arduino sketch. Copy `secrets.h.example` to `secrets.h` first. |
+| `firmware/soundbud/` | Speaker sketch. Copy `secrets.h.example` to `secrets.h` first. |
+| `firmware/sensors/` | Sensor node sketch. Its own `secrets.h` — separate file, separate project. |
 | `cad/plates.py` | CadQuery script deriving sandwich-mount plates from the vendor STEP. |
 
 ### The reply comes back before the music
@@ -71,6 +72,26 @@ Consequence: the backend's `volume` and the device's drift apart once the knob i
 touched, so "turn it down" is computed from a stale value. Fix when it matters by
 passing the device's volume up with the next utterance.
 
+### Firmware lives in Axiometa Studio
+
+Studio is the source of truth for both sketches; the copies here are version
+history, updated when something works. The backend is the opposite — it runs from
+this repo, so edit it here directly.
+
+### Three things that cost hours
+
+- **`audio_eof_mp3` never fires for `connecttohost`.** That callback is for
+  `connecttoFS`; network streams use `audio_eof_stream`, and which exists varies
+  by library version. End of stream is detected by polling `audio.isRunning()`
+  with a 1.5s grace period instead. `isPaused` must be excluded from that check,
+  or pausing reads as the track ending.
+- **NeoPixel writes disable interrupts.** Calling `strip.show()` every loop
+  audibly glitches the I2S stream. Both the matrix and the equaliser only push
+  when their content actually changed.
+- **The GPS is at 115200, not the datasheet's 9600.** Garbage in the raw echo
+  means the wrong baud; silence means no bytes at all. Those look identical
+  without an echo to read.
+
 ### Two facts worth not rediscovering
 
 - **ElevenLabs rejects `seed` when `prompt` is set.** There is no continuity knob, so
@@ -84,16 +105,26 @@ passing the device's volume up with the next utterance.
 
 From the Axiometa catalogue (checked against the live product pages):
 
-Current port assignment on the built device:
+Two boards, both talking only to the backend — never to each other.
+
+**Speaker** (Genesis One) — `firmware/soundbud/`
 
 | Port | Module |
 |---|---|
-| P1 | Rotary encoder — volume |
-| P2 | IPS LCD 0.96" (ST7735, 160×80) |
+| P1 | Rotary encoder — volume, push to pause |
+| P2 | IPS LCD 0.96" (ST7735, 160×80) — equaliser while playing |
 | P3 | Button — push to talk |
-| P4 | NeoPixel 5×5 matrix — volume level |
+| P4 | NeoPixel 5×5 matrix — volume digit / pause glyph |
 | P5 | PDM mic |
 | P8 | MAX98357A amp → speaker |
+
+**Sensor node** (Genesis Mini) — `firmware/sensors/`
+
+| Port | Module |
+|---|---|
+| P1 | DHT11 — indoor temperature and humidity |
+| P3 | GNSS ATGM336H — 115200 baud, never fixes indoors |
+| P4 | IPS LCD 0.96" — in/out conditions |
 
 | Need | Part | Note |
 |---|---|---|
