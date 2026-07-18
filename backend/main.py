@@ -17,7 +17,7 @@ from typing import Literal
 import anthropic
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastmcp import FastMCP
 from pydantic import BaseModel
@@ -45,6 +45,17 @@ PUBLIC_URL = os.getenv("SOUNDBUD_URL", "http://localhost:8000").rstrip("/")
 # in `music`. Useful when testing against a device that has a screen but no
 # speaker — saves a minute of waiting and the ElevenLabs credits.
 GENERATE_AUDIO = os.getenv("SOUNDBUD_AUDIO", "1") == "1"
+
+# ~100KB per second of mp3. 30s keeps a track near 2.8MB, which the device can
+# stream comfortably; a 5-minute track is 28MB and stalls it. Claude picks the
+# duration and is not schema-constrained, so this is enforced, not requested.
+MAX_DURATION_MS = 30_000
+MIN_DURATION_MS = 10_000  # ElevenLabs rejects anything shorter
+
+# 8s of 16kHz mono PCM is ~256KB. 2MB leaves room for a longer clip without
+# letting an unbounded body read chew all our memory.
+MAX_UPLOAD_BYTES = 2_000_000
+WAV_HEADER_BYTES = 44
 
 claude = anthropic.Anthropic()
 
@@ -92,6 +103,9 @@ Choosing the intent is the most important thing you do:
 
 If genuinely ambiguous between set_volume and modify_track, prefer set_volume:
 it is instant, free, and trivially corrected.
+
+`duration_ms` must be 30000. The playback device streams over WiFi and longer
+tracks are too large for it.
 
 `screen` must be at most 20 characters — it goes on a 160x80 display.
 `say` is one short friendly sentence; it is played while music generates, so it
@@ -142,12 +156,13 @@ def plan_from(utterance: str) -> Plan:
 def generate(spec: TrackSpec) -> str:
     """Generate a track, save it, return its filename."""
     started = time.monotonic()
+    length_ms = min(MAX_DURATION_MS, max(MIN_DURATION_MS, spec.duration_ms))
     r = httpx.post(
         f"{ELEVEN}/music",
         headers={"xi-api-key": os.environ["ELEVENLABS_API_KEY"]},
         json={
             "prompt": spec.prompt,
-            "music_length_ms": spec.duration_ms,
+            "music_length_ms": length_ms,
             "model_id": "music_v1",
             "force_instrumental": spec.instrumental,
         },
@@ -170,10 +185,10 @@ def generate_music(prompt: str, duration_seconds: int = 30,
 
     `prompt` describes the music: genre, mood, instruments, tempo. Be specific —
     "slow lo-fi hip hop, warm rhodes, vinyl crackle" beats "chill music".
-    Takes up to a couple of minutes. Duration is clamped to 10..300 seconds.
+    Takes up to a couple of minutes. Duration is clamped to 10..30 seconds so the
+    playback device can stream the result.
     """
-    seconds = min(300, max(10, duration_seconds))
-    spec = TrackSpec(prompt=prompt, duration_ms=seconds * 1000,
+    spec = TrackSpec(prompt=prompt, duration_ms=duration_seconds * 1000,
                      instrumental=instrumental)
     return f"{PUBLIC_URL}/tracks/{generate(spec)}"
 
@@ -215,7 +230,14 @@ def health():
 async def utterance(request: Request):
     global current_track, volume
 
+    # Validate at the boundary: a device sending junk should get a clear 4xx,
+    # not an opaque 500 from deep inside the ElevenLabs call.
     wav = await request.body()
+    if len(wav) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"body over {MAX_UPLOAD_BYTES} bytes")
+    if len(wav) < WAV_HEADER_BYTES or wav[:4] != b"RIFF" or wav[8:12] != b"WAVE":
+        raise HTTPException(400, "expected raw WAV bytes as the request body")
+
     text = transcribe(wav)
     print(f"heard: {text!r}")
 
@@ -228,18 +250,26 @@ async def utterance(request: Request):
     # speaker, and useful for debugging once there is one.
     music = current_track.prompt if needs_generation else None
 
+    say, screen = plan.say, plan.screen[:20]
+
     audio_url = None
     if needs_generation and GENERATE_AUDIO:
-        name = generate(current_track)
-        # base_url is whatever host the device reached us on, so this is
-        # already the right LAN address without configuring it anywhere.
-        audio_url = f"{str(request.base_url).rstrip('/')}/tracks/{name}"
+        try:
+            name = generate(current_track)
+            # base_url is whatever host the device reached us on, so this is
+            # already the right LAN address without configuring it anywhere.
+            audio_url = f"{str(request.base_url).rstrip('/')}/tracks/{name}"
+        except httpx.HTTPError as exc:
+            # The device is headless apart from a 20-char screen. A 500 leaves it
+            # showing nothing, so degrade to a normal reply it can display.
+            print(f"generation failed: {exc}")
+            say, screen = "Sorry, I could not make that track.", "Failed - retry"
     elif music:
         print(f"music (not generated): {music}")
 
     return {
-        "say": plan.say,
-        "screen": plan.screen[:20],
+        "say": say,
+        "screen": screen,
         "music": music,
         "audio_url": audio_url,
         "volume": round(volume, 2),
