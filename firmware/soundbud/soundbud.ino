@@ -1,203 +1,310 @@
-// soundBud — step 1 hardware check.
+// soundBud — voice in, generated music out.
 //
-// Proves button + I2S mic + PSRAM buffer + IPS screen all work, with no
-// network and no API key. Hold the button, speak, release.
+// P1 ST7735 display | P2 MAX98357A amp | P3 PDM mic | P4 button
 //
-//   idle       "READY / hold button"
-//   recording  live peak-level bar + elapsed seconds
-//   released   duration, bytes captured, peak level
+// Hold the button to record, release to send. The backend transcribes, decides
+// what you meant, generates a track, and returns JSON with a URL. We stream the
+// MP3 straight from that URL — it is never stored on the device.
 //
-// The level bar is the point: it is the only way to see that the mic is
-// actually capturing sound rather than silently returning zeros.
+// Press the button while music is playing to interrupt it and talk again; that
+// is how follow-up commands ("make it calmer", "louder") work, and it doubles as
+// echo cancellation since playback stops before the mic opens.
 //
-// Board: Axiometa PIXIE M1 (ESP32-S3, 4MB flash / 2MB PSRAM).
-// Arduino IDE: select an ESP32-S3 board, and set PSRAM to "OPI PSRAM".
-// Libraries: Adafruit_ST7735, Adafruit_GFX. (ESP_I2S ships with core 3.x.)
+// Copy secrets.h.example to secrets.h before building.
+// Board: ESP32-S3. Set PSRAM to "OPI PSRAM" and pick a partition scheme that
+// includes SPIFFS, or recording has nowhere to write.
 
+#include "secrets.h"
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <FS.h>
+#include <SPIFFS.h>
+#include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7735.h>
 #include <ESP_I2S.h>
+#include <Audio.h>
+#include <ArduinoJson.h>
 
-// ─────────────────────────────────────────────────────────────────────────
-// SET THESE. Pin numbers come from PIN_MTA0007.png on the PIXIE M1 product
-// page; the display driver is stamped on the LCD module itself.
-// Everything below this block is board-agnostic.
-// ─────────────────────────────────────────────────────────────────────────
+#define SAMPLE_RATE      16000
+#define MAX_RECORD_SECS  8
 
-// Push-to-talk button. The PIXIE M1 has an onboard User button — use its
-// GPIO here and you need no external wiring to test.
-constexpr int PIN_BUTTON = 0;  // active low, internal pullup
+// P1 — TFT
+#define TFT_CS   P1_IO0
+#define TFT_RST  P1_IO1
+#define TFT_DC   P1_IO2
+// P2 — amp: BCLK=P2_IO1, LRC=P2_IO2, DIN=P2_IO0
+// P3 — PDM mic: SEL=P3_IO0, CLK=P3_IO2, DATA=P3_IO1
+// P4 — button
+#define BTN_PIN  P4_IO1
 
-// IPS LCD, SPI.
-constexpr int PIN_TFT_CS   = 10;
-constexpr int PIN_TFT_DC   = 9;
-constexpr int PIN_TFT_RST  = 8;
-constexpr int PIN_TFT_SCLK = 12;
-constexpr int PIN_TFT_MOSI = 11;
+enum AppState { IDLE, RECORDING, PROCESSING, PLAYING };
+AppState appState = IDLE;
 
-// I2S digital mic (INMP441 / ICS-43434). Tie the mic's L/R pin to GND for
-// the left channel, which is what SLOT_MODE_MONO reads.
-constexpr int PIN_I2S_BCLK = 4;  // mic SCK
-constexpr int PIN_I2S_WS   = 5;  // mic WS / LRCL
-constexpr int PIN_I2S_DIN  = 6;  // mic SD
+SPIClass          mySPI(FSPI);
+Adafruit_ST7735   tft = Adafruit_ST7735(&mySPI, TFT_CS, TFT_DC, TFT_RST);
+GFXcanvas16       canvas(160, 80);
+I2SClass          i2s;
+Audio             audio;
 
-// 0.96" IPS is usually 160x80 ST7735S. If text is offset or mirrored, the
-// initR() tab constant in setup() is the thing to change first.
-constexpr int SCREEN_W = 160;
-constexpr int SCREEN_H = 80;
+File   recFile;                // open only while recording
+size_t recSamples = 0;
+bool   micActive  = false;
 
-// ─────────────────────────────────────────────────────────────────────────
+bool          btnLast      = HIGH;
+bool          displayDirty = true;
+unsigned long lastDrawMs   = 0;
+char          screenText[24] = "";   // last `screen` field from the backend
 
-constexpr uint32_t SAMPLE_RATE   = 16000;  // what speech-to-text wants
-constexpr uint32_t MAX_SECONDS   = 10;
-constexpr size_t   BUFFER_BYTES  = SAMPLE_RATE * 2 * MAX_SECONDS;  // 320KB
-constexpr uint32_t DEBOUNCE_MS   = 40;
+// This panel is BGR, so swap on the way in.
+uint16_t col(uint8_t r, uint8_t g, uint8_t b) { return tft.color565(b, g, r); }
 
-Adafruit_ST7735 tft(PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_RST);
-I2SClass i2s;
+// ── display ─────────────────────────────────────────────────────────────────
 
-int16_t *recording = nullptr;  // PSRAM
-size_t   recordedBytes = 0;
-bool     isRecording = false;
-uint32_t recordStartMs = 0;
-int16_t  peak = 0;
-
-// Redraw only what changed — the full-screen clear is slow enough to stutter
-// the level bar if done every frame.
-int lastBarWidth = -1;
-int lastSeconds  = -1;
-
-void showMessage(const char *line1, const char *line2, uint16_t colour) {
-  tft.fillScreen(ST77XX_BLACK);
-  tft.setTextColor(colour);
-  tft.setTextSize(2);
-  tft.setCursor(6, 16);
-  tft.print(line1);
-  if (line2) {
-    tft.setTextSize(1);
-    tft.setCursor(6, 46);
-    tft.print(line2);
+void redrawDisplay() {
+  canvas.fillScreen(0x0000);
+  switch (appState) {
+    case IDLE:
+      canvas.setTextColor(col(200, 200, 200));
+      canvas.setTextSize(2);
+      canvas.setCursor(8, 10);  canvas.print("Hold button");
+      canvas.setCursor(20, 38); canvas.print("to record");
+      break;
+    case RECORDING:
+      canvas.fillScreen(col(160, 20, 20));
+      canvas.setTextColor(0xFFFF);
+      canvas.setTextSize(3);
+      canvas.setCursor(28, 8);  canvas.print("REC");
+      canvas.setTextSize(1);
+      canvas.setCursor(16, 62); canvas.print("Release to send");
+      break;
+    case PROCESSING:
+      canvas.setTextColor(col(255, 200, 50));
+      canvas.setTextSize(2);
+      canvas.setCursor(16, 10); canvas.print("Sending");
+      canvas.setCursor(16, 38); canvas.print("audio...");
+      break;
+    case PLAYING:
+      canvas.setTextColor(col(50, 220, 100));
+      canvas.setTextSize(2);
+      canvas.setCursor(8, 20);
+      // The backend sizes `screen` to 20 chars for exactly this.
+      canvas.print(screenText[0] ? screenText : "Playing");
+      canvas.setTextSize(1);
+      canvas.setTextColor(col(90, 90, 90));
+      canvas.setCursor(8, 62);  canvas.print("Hold to interrupt");
+      break;
   }
+  tft.drawRGBBitmap(0, 0, canvas.getBuffer(), 160, 80);
 }
 
-void showFatal(const char *what) {
-  showMessage("ERROR", what, ST77XX_RED);
-  Serial.printf("FATAL: %s\n", what);
-  while (true) delay(1000);
+// ── WAV header ──────────────────────────────────────────────────────────────
+
+void writeU16LE(File& f, uint16_t v) { f.write((uint8_t*)&v, 2); }
+void writeU32LE(File& f, uint32_t v) { f.write((uint8_t*)&v, 4); }
+
+void writeWavHeader(File& f, uint32_t numSamples) {
+  uint32_t dataBytes = numSamples * 2;
+  f.write((const uint8_t*)"RIFF", 4);  writeU32LE(f, 36 + dataBytes);
+  f.write((const uint8_t*)"WAVE", 4);
+  f.write((const uint8_t*)"fmt ", 4);  writeU32LE(f, 16);
+  writeU16LE(f, 1);                    // PCM
+  writeU16LE(f, 1);                    // mono
+  writeU32LE(f, SAMPLE_RATE);
+  writeU32LE(f, SAMPLE_RATE * 2);      // byte rate
+  writeU16LE(f, 2);                    // block align
+  writeU16LE(f, 16);                   // bits per sample
+  f.write((const uint8_t*)"data", 4);  writeU32LE(f, dataBytes);
 }
+
+// Sample count is unknown until the button comes up, so the header goes down as
+// a placeholder and the two size fields get patched in afterwards.
+void patchWavSizes(File& f, uint32_t numSamples) {
+  uint32_t dataBytes = numSamples * 2;
+  f.seek(4);  writeU32LE(f, 36 + dataBytes);
+  f.seek(40); writeU32LE(f, dataBytes);
+}
+
+// ── mic ─────────────────────────────────────────────────────────────────────
+
+bool startMic() {
+  if (micActive) return true;
+  pinMode(P3_IO0, OUTPUT);
+  digitalWrite(P3_IO0, LOW);          // SEL low → left/mono slot
+  i2s.setPinsPdmRx(P3_IO2, P3_IO1);   // CLK, DATA
+  if (!i2s.begin(I2S_MODE_PDM_RX, SAMPLE_RATE,
+                 I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
+    Serial.println("Mic init failed");
+    return false;
+  }
+  micActive = true;
+  return true;
+}
+
+void stopMic() {
+  if (!micActive) return;
+  i2s.end();
+  micActive = false;
+}
+
+// ── record ──────────────────────────────────────────────────────────────────
+
+void beginRecording() {
+  audio.stopSong();   // also stops the speaker feeding the mic
+  delay(20);
+
+  recFile = SPIFFS.open("/rec.wav", "w");
+  if (!recFile) { Serial.println("Cannot open /rec.wav"); return; }
+  writeWavHeader(recFile, 0);
+  recSamples = 0;
+
+  if (!startMic()) { recFile.close(); return; }
+
+  appState = RECORDING;
+  displayDirty = true;
+  Serial.println("Recording...");
+}
+
+void sendAndPlay() {
+  stopMic();
+  patchWavSizes(recFile, recSamples);
+  recFile.close();
+
+  appState = PROCESSING;
+  redrawDisplay();   // draw now; the POST below blocks for up to 3 minutes
+
+  Serial.printf("Captured %u samples (%.1f s)\n",
+                recSamples, recSamples / (float)SAMPLE_RATE);
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi lost — skipping send");
+    appState = IDLE; displayDirty = true; return;
+  }
+
+  File wavFile = SPIFFS.open("/rec.wav", "r");
+  if (!wavFile) {
+    Serial.println("WAV re-open failed");
+    appState = IDLE; displayDirty = true; return;
+  }
+
+  HTTPClient http;
+  WiFiClient client;
+  http.begin(client, String(BACKEND_URL) + "/utterance");
+  http.addHeader("Content-Type", "audio/wav");
+  http.setTimeout(180000);   // generation is slow; a short timeout abandons good requests
+
+  int code = http.sendRequest("POST", &wavFile, wavFile.size());
+  wavFile.close();
+  Serial.printf("POST /utterance -> HTTP %d\n", code);
+
+  if (code != 200) {
+    http.end();
+    appState = IDLE; displayDirty = true; return;
+  }
+
+  String body = http.getString();
+  http.end();
+
+  // Grows as needed — a fixed capacity silently fails on a long `music` field.
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    Serial.printf("JSON parse error: %s\n", err.c_str());
+    appState = IDLE; displayDirty = true; return;
+  }
+
+  const char* url = doc["audio_url"] | "";
+  const char* scr = doc["screen"]    | "";
+  int vol = (int)((doc["volume"] | 0.6f) * 21);   // backend sends 0..1, library wants 0..21
+  snprintf(screenText, sizeof(screenText), "%s", scr);
+  Serial.printf("screen: %s  volume: %d  url: %s\n", scr, vol, url);
+
+  audio.setVolume(vol);
+
+  // Null for volume and transport commands — nothing new to fetch, and the
+  // volume above has already been applied to whatever is playing.
+  if (strlen(url) == 0) { appState = IDLE; displayDirty = true; return; }
+
+  appState = PLAYING;
+  displayDirty = true;
+  redrawDisplay();
+  audio.connecttohost(url);
+}
+
+// Weak-linked by ESP32-audioI2S; fires when the stream ends.
+void audio_eof_mp3(const char* info) {
+  Serial.println("Playback finished");
+  appState = IDLE;
+  displayDirty = true;
+}
+
+// ── setup ───────────────────────────────────────────────────────────────────
 
 void setup() {
   Serial.begin(115200);
+  pinMode(BTN_PIN, INPUT);
 
-  pinMode(PIN_BUTTON, INPUT_PULLUP);
+  mySPI.begin(SCK, MISO, MOSI);
+  tft.initR(INITR_MINI160x80);
+  tft.setRotation(3);
+  tft.fillScreen(0x0000);
+  tft.setTextColor(0xFFFF);
+  tft.setTextSize(1);
+  tft.setCursor(30, 36);
+  tft.print("Connecting...");
 
-  SPI.begin(PIN_TFT_SCLK, -1, PIN_TFT_MOSI, PIN_TFT_CS);
-  tft.initR(INITR_MINI160x80);  // wrong colours or offset? try INITR_BLACKTAB
-  tft.setRotation(1);
-  tft.fillScreen(ST77XX_BLACK);
-
-  // PSRAM must be enabled in the board menu, or this returns null and we'd
-  // otherwise crash on the first sample write.
-  recording = (int16_t *)ps_malloc(BUFFER_BYTES);
-  if (!recording) showFatal("no PSRAM - enable\nit in board menu");
-
-  i2s.setPins(PIN_I2S_BCLK, PIN_I2S_WS, -1, PIN_I2S_DIN, -1);
-  if (!i2s.begin(I2S_MODE_STD, SAMPLE_RATE, I2S_DATA_BIT_WIDTH_16BIT,
-                 I2S_SLOT_MODE_MONO)) {
-    showFatal("i2s mic failed\ncheck wiring");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.printf("Connecting to WiFi '%s'", WIFI_SSID);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    delay(500); Serial.print(".");
   }
+  if (WiFi.status() == WL_CONNECTED)
+    Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
+  else
+    Serial.printf("\nWiFi failed for '%s'\n", WIFI_SSID);
 
-  Serial.printf("ready: %u byte buffer, %u s max\n",
-                (unsigned)BUFFER_BYTES, (unsigned)MAX_SECONDS);
-  showMessage("READY", "hold button to talk", ST77XX_WHITE);
+  // -10025 here means the partition scheme has no SPIFFS partition to format.
+  if (!SPIFFS.begin(true)) Serial.println("SPIFFS mount failed");
+
+  audio.setPinout(P2_IO1, P2_IO2, P2_IO0);
+
+  appState = IDLE;
+  displayDirty = true;
+  Serial.println("Ready — hold P4 button to record");
 }
 
-// Reads whatever the mic has ready, appends it to the PSRAM buffer, and
-// returns the loudest sample seen in this chunk.
-int16_t captureChunk() {
-  static int16_t chunk[512];
-
-  size_t room = BUFFER_BYTES - recordedBytes;
-  if (room == 0) return 0;
-
-  size_t want = min(sizeof(chunk), room);
-  size_t got  = i2s.readBytes((char *)chunk, want);
-  if (got == 0) return 0;
-
-  memcpy((uint8_t *)recording + recordedBytes, chunk, got);
-  recordedBytes += got;
-
-  int16_t chunkPeak = 0;
-  for (size_t i = 0; i < got / 2; i++) {
-    int16_t v = chunk[i] < 0 ? -chunk[i] : chunk[i];  // abs, INT16_MIN-safe enough
-    if (v > chunkPeak) chunkPeak = v;
-  }
-  return chunkPeak;
-}
-
-void drawRecordingScreen(int16_t level, uint32_t elapsedMs) {
-  int barWidth = map(level, 0, 8000, 0, SCREEN_W - 12);
-  barWidth = constrain(barWidth, 0, SCREEN_W - 12);
-  int seconds = elapsedMs / 1000;
-
-  if (seconds != lastSeconds) {
-    tft.fillRect(0, 8, SCREEN_W, 22, ST77XX_BLACK);
-    tft.setTextColor(ST77XX_RED);
-    tft.setTextSize(2);
-    tft.setCursor(6, 10);
-    tft.printf("REC %ds", seconds);
-    lastSeconds = seconds;
-  }
-
-  if (barWidth != lastBarWidth) {
-    tft.fillRect(6, 44, SCREEN_W - 12, 14, ST77XX_BLACK);
-    tft.fillRect(6, 44, barWidth, 14, ST77XX_GREEN);
-    lastBarWidth = barWidth;
-  }
-}
+// ── loop ────────────────────────────────────────────────────────────────────
 
 void loop() {
-  static bool     lastPressed = false;
-  static uint32_t lastChangeMs = 0;
+  audio.loop();   // must run every pass while audio is active
 
-  bool pressed = digitalRead(PIN_BUTTON) == LOW;
-
-  if (pressed != lastPressed && millis() - lastChangeMs > DEBOUNCE_MS) {
-    lastChangeMs = millis();
-    lastPressed = pressed;
-
-    if (pressed) {
-      recordedBytes = 0;
-      peak = 0;
-      isRecording = true;
-      recordStartMs = millis();
-      lastBarWidth = -1;
-      lastSeconds = -1;
-      tft.fillScreen(ST77XX_BLACK);
-    } else if (isRecording) {
-      isRecording = false;
-      uint32_t ms = millis() - recordStartMs;
-
-      char summary[64];
-      snprintf(summary, sizeof(summary), "%.1fs  %uKB\npeak %d",
-               ms / 1000.0f, (unsigned)(recordedBytes / 1024), peak);
-      // Silence almost always means wiring, not a quiet room.
-      showMessage(peak > 200 ? "GOT IT" : "SILENT", summary,
-                  peak > 200 ? ST77XX_GREEN : ST77XX_YELLOW);
-
-      Serial.printf("captured %u bytes in %u ms, peak %d\n",
-                    (unsigned)recordedBytes, (unsigned)ms, peak);
-    }
+  if (displayDirty && millis() - lastDrawMs >= 33) {   // ~30fps ceiling
+    redrawDisplay();
+    lastDrawMs = millis();
+    displayDirty = false;
   }
 
-  if (isRecording) {
-    int16_t level = captureChunk();
-    if (level > peak) peak = level;
-    drawRecordingScreen(level, millis() - recordStartMs);
+  bool btnNow   = digitalRead(BTN_PIN);
+  bool pressed  = (btnLast == HIGH && btnNow == LOW);
+  bool released = (btnLast == LOW  && btnNow == HIGH);
+  btnLast = btnNow;
 
-    if (recordedBytes >= BUFFER_BYTES) {
-      isRecording = false;
-      showMessage("FULL", "10s limit reached", ST77XX_YELLOW);
+  // PLAYING is included so a follow-up command can interrupt the track.
+  if (pressed && (appState == IDLE || appState == PLAYING)) beginRecording();
+  if (released && appState == RECORDING) sendAndPlay();
+
+  if (appState == RECORDING && recFile && micActive) {
+    // 1KB at a time straight to flash — the whole clip never sits in RAM.
+    int16_t tmp[512];
+    size_t got = i2s.readBytes((char*)tmp, sizeof(tmp));
+    if (got > 0) {
+      recFile.write((uint8_t*)tmp, got);
+      recSamples += got / 2;
+      if (recSamples >= (size_t)MAX_RECORD_SECS * SAMPLE_RATE) {
+        Serial.println("Max length reached, sending...");
+        sendAndPlay();
+      }
     }
   }
 }

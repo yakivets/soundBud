@@ -46,11 +46,12 @@ PUBLIC_URL = os.getenv("SOUNDBUD_URL", "http://localhost:8000").rstrip("/")
 # speaker — saves a minute of waiting and the ElevenLabs credits.
 GENERATE_AUDIO = os.getenv("SOUNDBUD_AUDIO", "1") == "1"
 
-# ~100KB per second of mp3. 30s keeps a track near 2.8MB, which the device can
-# stream comfortably; a 5-minute track is 28MB and stalls it. Claude picks the
-# duration and is not schema-constrained, so this is enforced, not requested.
-MAX_DURATION_MS = 30_000
-MIN_DURATION_MS = 10_000  # ElevenLabs rejects anything shorter
+# The device streams over WiFi rather than buffering the file, so length costs
+# generation time, not memory. 90s is the ceiling because that is roughly where
+# waiting for a track stops feeling responsive. Claude picks the duration and is
+# not schema-constrained, so this is enforced, not requested.
+MAX_DURATION_MS = 90_000
+MIN_DURATION_MS = 30_000  # shorter than this loops back too fast to enjoy
 
 # 8s of 16kHz mono PCM is ~256KB. 2MB leaves room for a longer clip without
 # letting an unbounded body read chew all our memory.
@@ -104,8 +105,9 @@ Choosing the intent is the most important thing you do:
 If genuinely ambiguous between set_volume and modify_track, prefer set_volume:
 it is instant, free, and trivially corrected.
 
-`duration_ms` must be 30000. The playback device streams over WiFi and longer
-tracks are too large for it.
+`duration_ms` should be 60000 for a normal request. Go longer (up to 90000) only
+if the user asks for something extended, and shorter (min 30000) only if they ask
+for something brief — every second adds generation time they spend waiting.
 
 `screen` must be at most 20 characters — it goes on a 160x80 display.
 `say` is one short friendly sentence; it is played while music generates, so it
@@ -179,14 +181,13 @@ def generate(spec: TrackSpec) -> str:
 
 
 @mcp.tool
-def generate_music(prompt: str, duration_seconds: int = 30,
+def generate_music(prompt: str, duration_seconds: int = 60,
                    instrumental: bool = True) -> str:
     """Generate a music track and return a URL to the mp3.
 
     `prompt` describes the music: genre, mood, instruments, tempo. Be specific —
     "slow lo-fi hip hop, warm rhodes, vinyl crackle" beats "chill music".
-    Takes up to a couple of minutes. Duration is clamped to 10..30 seconds so the
-    playback device can stream the result.
+    Takes up to a couple of minutes. Duration is clamped to 30..90 seconds.
     """
     spec = TrackSpec(prompt=prompt, duration_ms=duration_seconds * 1000,
                      instrumental=instrumental)

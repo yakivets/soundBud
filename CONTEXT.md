@@ -3,11 +3,30 @@
 You talk to it, it generates music, it plays on its own speaker. Follow-up commands modify
 the track you're hearing instead of starting over. Built at Axiometa London hackathon.
 
-**Status:** design context. Nothing built yet.
+**Status: working end to end.** Hold the button, speak, and a generated track plays from the
+device's own speaker. Backend in `backend/`, firmware in `firmware/soundbud/`, enclosure
+plates in `cad/`.
 
 **Scope: the prototype.** One device — voice in, generated song out of its own speaker,
-follow-up commands that modify what's playing. The eventual three-device split (output /
-input / vision) is noted at the bottom but is not what we're building.
+follow-up commands that modify what's playing. The earlier plan for a separate handheld
+remote is dropped: one Genesis-class board carries mic, amp, screen and button, so there is
+no second firmware, no pairing, and no device-to-device protocol.
+
+### What the pieces do
+
+| Path | What it is |
+|---|---|
+| `backend/main.py` | FastAPI. `POST /utterance` takes a raw WAV, transcribes it, asks Claude what the user meant, generates a track, returns JSON. |
+| `backend/talk.py` | Laptop stand-in for the device — same contract, useful when the hardware is not on the bench. |
+| `firmware/soundbud/` | Arduino sketch. Copy `secrets.h.example` to `secrets.h` first. |
+| `cad/plates.py` | CadQuery script deriving sandwich-mount plates from the vendor STEP. |
+
+### Two facts worth not rediscovering
+
+- **ElevenLabs rejects `seed` when `prompt` is set.** There is no continuity knob, so
+  "make it calmer" re-rolls a new song rather than adjusting the current one.
+- **Mounting holes are ⌀3.40mm (M3), not the ⌀2.7mm the product page claims.** Measured off
+  the official STEP.
 
 ---
 

@@ -8,3 +8,9 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# firmware credentials — copy secrets.h.example to secrets.h
+firmware/**/secrets.h
+
+# generated CAD output
+cad/out/
