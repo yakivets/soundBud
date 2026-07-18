@@ -451,8 +451,13 @@ def health():
 
 
 @app.post("/utterance")
-async def utterance(request: Request):
+async def utterance(request: Request, volume_now: float | None = None):
+    """`volume_now` is the device's actual 0..1 level, which the knob can change
+    without telling us. Trust it over our own copy, or "turn it down" is computed
+    from a stale number."""
     global current_track, volume
+    if volume_now is not None:
+        volume = min(1.0, max(0.0, volume_now))
 
     # Validate at the boundary: a device sending junk should get a clear 4xx,
     # not an opaque 500 from deep inside the ElevenLabs call.
@@ -503,6 +508,9 @@ async def utterance(request: Request):
         "music_pending": generating,
         "audio_url": None,
         "volume": round(volume, 2),
+        # Only honour `volume` when this is true. Otherwise it is just our copy
+        # of what the device already has, and applying it would stamp on the knob.
+        "set_volume": plan.intent == "set_volume",
     }
 
 
