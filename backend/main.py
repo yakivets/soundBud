@@ -215,7 +215,7 @@ OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
 GEOCODE = "https://geocoding-api.open-meteo.com/v1/search"
 WEATHER_TTL = 900.0     # 15 minutes
 _geo_cache: dict[str, tuple[float, float, str]] = {}
-_weather: tuple[float, str] = (0.0, "")   # (fetched_at, description)
+_weather: tuple[float, str, float | None] = (0.0, "", None)   # (at, text, outside_c)
 
 # WMO weather codes, collapsed to what matters for choosing music.
 WMO = [
@@ -266,16 +266,17 @@ def weather_now() -> str:
     """Outside conditions in plain English. Cached, and never fatal — losing the
     weather should degrade the vibe, not break the request."""
     global _weather
-    fetched, text = _weather
+    fetched, text, _ = _weather
     if time.time() - fetched < WEATHER_TTL:
         return text
 
     here = locate()
     if here is None:
         return ""
-    lat, lon, _ = here
+    lat, lon, _name = here
     if not lat and not lon:      # geocode failed; we have a name but no coordinates
         return ""
+    outside_c = None
     try:
         r = httpx.get(OPEN_METEO, params={
             "latitude": lat, "longitude": lon,
@@ -283,14 +284,15 @@ def weather_now() -> str:
         cur = r.json()["current"]
         code = cur["weather_code"]
         sky = next(word for limit, word in WMO if code <= limit)
-        text = f"{sky} and {cur['temperature_2m']:.0f}°C outside"
+        outside_c = cur["temperature_2m"]
+        text = f"{sky} and {outside_c:.0f}°C outside"
         if cur["wind_speed_10m"] > 30:
             text += ", windy"
     except Exception as exc:
         print(f"weather lookup failed: {exc}")
         text = ""
 
-    _weather = (time.time(), text)
+    _weather = (time.time(), text, outside_c)
     return text
 
 
@@ -511,7 +513,19 @@ def post_ambient(reading: Ambient):
     global ambient, ambient_at
     ambient, ambient_at = reading, time.time()
     print(f"ambient: {describe_ambient()}  (raw: {reading.model_dump_json()})")
-    return {"ok": True}
+
+    # The node has a screen but no way to know the weather or where it is, so the
+    # reply to its own POST carries that back. No extra request, no extra endpoint.
+    sky = weather_now()
+    here = locate()
+    return {
+        "ok": True,
+        "place": here[2] if here else "",
+        # Already split for a 160x80 panel — the device should not be parsing prose.
+        "sky": sky.split(" and ")[0] if sky else "",
+        "outside_c": _weather[2],
+        "time": time.strftime("%H:%M"),
+    }
 
 
 @mcp.tool
