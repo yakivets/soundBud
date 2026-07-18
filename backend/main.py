@@ -11,6 +11,7 @@ Run:  uvicorn main:app --host 0.0.0.0 --port 8000
 
 import os
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal
 
@@ -57,6 +58,11 @@ MIN_DURATION_MS = 30_000  # shorter than this loops back too fast to enjoy
 # letting an unbounded body read chew all our memory.
 MAX_UPLOAD_BYTES = 2_000_000
 WAV_HEADER_BYTES = 44
+
+# Stock ElevenLabs voice. flash_v2_5 because this sits directly in front of the
+# user — quality matters less than getting a reply out while music generates.
+VOICE_ID = os.getenv("SOUNDBUD_VOICE", "21m00Tcm4TlvDq8ikWAM")
+TTS_MODEL = "eleven_flash_v2_5"
 
 claude = anthropic.Anthropic()
 
@@ -121,6 +127,12 @@ should acknowledge what is coming."""
 current_track: TrackSpec | None = None
 volume: float = 0.6
 
+# Music generation runs here while the spoken reply goes back to the device, so
+# the user hears something within a couple of seconds instead of waiting out the
+# whole generation in silence. One worker: one device, one track at a time.
+_pool = ThreadPoolExecutor(max_workers=1)
+pending: Future | None = None
+
 
 # ─── steps ──────────────────────────────────────────────────────────────────
 
@@ -177,6 +189,24 @@ def generate(spec: TrackSpec) -> str:
     (TRACKS / name).write_bytes(r.content)
     print(f"generated {name} in {time.monotonic() - started:.1f}s "
           f"({len(r.content) // 1024}KB) :: {spec.prompt}")
+    return name
+
+
+def speak(text: str) -> str:
+    """Voice a line of text, save it, return its filename."""
+    started = time.monotonic()
+    r = httpx.post(
+        f"{ELEVEN}/text-to-speech/{VOICE_ID}",
+        headers={"xi-api-key": os.environ["ELEVENLABS_API_KEY"]},
+        json={"text": text, "model_id": TTS_MODEL},
+        params={"output_format": "mp3_44100_128"},
+        timeout=30.0,
+    )
+    r.raise_for_status()
+
+    name = f"say_{int(time.time() * 1000)}.mp3"
+    (TRACKS / name).write_bytes(r.content)
+    print(f"spoke {name} in {time.monotonic() - started:.1f}s :: {text}")
     return name
 
 
@@ -251,30 +281,60 @@ async def utterance(request: Request):
     # speaker, and useful for debugging once there is one.
     music = current_track.prompt if needs_generation else None
 
-    say, screen = plan.say, plan.screen[:20]
+    # base_url is whatever host the device reached us on, so URLs are already the
+    # right LAN address without configuring it anywhere.
+    base = str(request.base_url).rstrip("/")
 
-    audio_url = None
-    if needs_generation and GENERATE_AUDIO:
-        try:
-            name = generate(current_track)
-            # base_url is whatever host the device reached us on, so this is
-            # already the right LAN address without configuring it anywhere.
-            audio_url = f"{str(request.base_url).rstrip('/')}/tracks/{name}"
-        except httpx.HTTPError as exc:
-            # The device is headless apart from a 20-char screen. A 500 leaves it
-            # showing nothing, so degrade to a normal reply it can display.
-            print(f"generation failed: {exc}")
-            say, screen = "Sorry, I could not make that track.", "Failed - retry"
+    # Start the music first so it generates while the reply is being voiced.
+    global pending
+    generating = needs_generation and GENERATE_AUDIO
+    if generating:
+        track = current_track
+        pending = _pool.submit(lambda: generate(track))
     elif music:
         print(f"music (not generated): {music}")
 
+    speech_url = None
+    try:
+        speech_url = f"{base}/tracks/{speak(plan.say)}"
+    except httpx.HTTPError as exc:
+        # Losing the voice is survivable — the screen still says what happened.
+        print(f"tts failed: {exc}")
+
     return {
-        "say": say,
-        "screen": screen,
+        "say": plan.say,
+        "screen": plan.screen[:20],
         "music": music,
-        "audio_url": audio_url,
+        "speech_url": speech_url,
+        # True means: play the speech, then GET /track for the music.
+        "music_pending": generating,
+        "audio_url": None,
         "volume": round(volume, 2),
     }
+
+
+@app.get("/track")
+def track(request: Request):
+    """Wait for the in-flight generation and hand back its URL.
+
+    The device calls this once the spoken reply has finished playing. Blocking is
+    deliberate — by then the track is usually already done, and a blocking read is
+    far less firmware than a polling loop.
+    """
+    global pending
+    if pending is None:
+        return {"audio_url": None, "screen": "Nothing queued"}
+
+    try:
+        name = pending.result(timeout=GENERATION_TIMEOUT)
+    except Exception as exc:
+        print(f"generation failed: {exc}")
+        return {"audio_url": None, "screen": "Failed - retry"}
+    finally:
+        pending = None
+
+    return {"audio_url": f"{str(request.base_url).rstrip('/')}/tracks/{name}",
+            "screen": "Now playing"}
 
 
 if __name__ == "__main__":

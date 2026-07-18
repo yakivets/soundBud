@@ -1,14 +1,18 @@
 // soundBud — voice in, generated music out.
 //
-// P1 ST7735 display | P2 MAX98357A amp | P3 PDM mic | P4 button
+// P2 ST7735 display | P8 MAX98357A amp | P5 PDM mic | P3 button
 //
-// Hold the button to record, release to send. The backend transcribes, decides
-// what you meant, generates a track, and returns JSON with a URL. We stream the
-// MP3 straight from that URL — it is never stored on the device.
+// Hold the button to record, release to send. Then two things come back:
 //
-// Press the button while music is playing to interrupt it and talk again; that
-// is how follow-up commands ("make it calmer", "louder") work, and it doubles as
-// echo cancellation since playback stops before the mic opens.
+//   1. A spoken reply, within a couple of seconds. The backend voices Claude's
+//      answer while the music is still generating, so the device talks back
+//      instead of going silent for fifteen seconds.
+//   2. The track itself. When the reply finishes playing we GET /track, which
+//      blocks until generation is done — usually no wait at all by then.
+//
+// Press the button during either one to interrupt and talk again; that is how
+// follow-up commands ("make it calmer", "louder") work, and it doubles as echo
+// cancellation since playback stops before the mic opens.
 //
 // Copy secrets.h.example to secrets.h before building.
 // Board: ESP32-S3. Set PSRAM to "OPI PSRAM" and pick a partition scheme that
@@ -29,16 +33,22 @@
 #define SAMPLE_RATE      16000
 #define MAX_RECORD_SECS  8
 
-// P1 — TFT
-#define TFT_CS   P1_IO0
-#define TFT_RST  P1_IO1
-#define TFT_DC   P1_IO2
-// P2 — amp: BCLK=P2_IO1, LRC=P2_IO2, DIN=P2_IO0
-// P3 — PDM mic: SEL=P3_IO0, CLK=P3_IO2, DATA=P3_IO1
-// P4 — button
-#define BTN_PIN  P4_IO1
+// P2 — TFT
+#define TFT_CS   P2_IO0
+#define TFT_RST  P2_IO1
+#define TFT_DC   P2_IO2
+// P8 — amp: BCLK=P8_IO1, LRC=P8_IO2, DIN=P8_IO0
+// P5 — PDM mic: SEL=P5_IO0, CLK=P5_IO2, DATA=P5_IO1
+// P3 — button
+#define BTN_PIN  P3_IO1
+#define MIC_SEL  P5_IO0
+#define MIC_CLK  P5_IO2
+#define MIC_DATA P5_IO1
+#define AMP_BCLK P8_IO1
+#define AMP_LRC  P8_IO2
+#define AMP_DIN  P8_IO0
 
-enum AppState { IDLE, RECORDING, PROCESSING, PLAYING };
+enum AppState { IDLE, RECORDING, PROCESSING, SPEAKING, PLAYING };
 AppState appState = IDLE;
 
 SPIClass          mySPI(FSPI);
@@ -55,6 +65,8 @@ bool          btnLast      = HIGH;
 bool          displayDirty = true;
 unsigned long lastDrawMs   = 0;
 char          screenText[24] = "";   // last `screen` field from the backend
+bool          musicPending = false;  // backend is generating a track for us
+bool          fetchTrack   = false;  // set from the audio callback, acted on in loop()
 
 // This panel is BGR, so swap on the way in.
 uint16_t col(uint8_t r, uint8_t g, uint8_t b) { return tft.color565(b, g, r); }
@@ -83,6 +95,15 @@ void redrawDisplay() {
       canvas.setTextSize(2);
       canvas.setCursor(16, 10); canvas.print("Sending");
       canvas.setCursor(16, 38); canvas.print("audio...");
+      break;
+    case SPEAKING:
+      canvas.setTextColor(col(120, 180, 255));
+      canvas.setTextSize(2);
+      canvas.setCursor(8, 20);
+      canvas.print(screenText[0] ? screenText : "...");
+      canvas.setTextSize(1);
+      canvas.setTextColor(col(90, 90, 90));
+      canvas.setCursor(8, 62);  canvas.print("Making your track");
       break;
     case PLAYING:
       canvas.setTextColor(col(50, 220, 100));
@@ -129,9 +150,9 @@ void patchWavSizes(File& f, uint32_t numSamples) {
 
 bool startMic() {
   if (micActive) return true;
-  pinMode(P3_IO0, OUTPUT);
-  digitalWrite(P3_IO0, LOW);          // SEL low → left/mono slot
-  i2s.setPinsPdmRx(P3_IO2, P3_IO1);   // CLK, DATA
+  pinMode(MIC_SEL, OUTPUT);
+  digitalWrite(MIC_SEL, LOW);          // SEL low → left/mono slot
+  i2s.setPinsPdmRx(MIC_CLK, MIC_DATA);   // CLK, DATA
   if (!i2s.begin(I2S_MODE_PDM_RX, SAMPLE_RATE,
                  I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
     Serial.println("Mic init failed");
@@ -213,16 +234,65 @@ void sendAndPlay() {
     appState = IDLE; displayDirty = true; return;
   }
 
-  const char* url = doc["audio_url"] | "";
-  const char* scr = doc["screen"]    | "";
+  const char* speech = doc["speech_url"] | "";
+  const char* scr    = doc["screen"]     | "";
+  musicPending = doc["music_pending"] | false;
   int vol = (int)((doc["volume"] | 0.6f) * 21);   // backend sends 0..1, library wants 0..21
   snprintf(screenText, sizeof(screenText), "%s", scr);
-  Serial.printf("screen: %s  volume: %d  url: %s\n", scr, vol, url);
+  Serial.printf("screen: %s  volume: %d  pending: %d\n", scr, vol, musicPending);
 
   audio.setVolume(vol);
 
-  // Null for volume and transport commands — nothing new to fetch, and the
-  // volume above has already been applied to whatever is playing.
+  // The spoken reply comes back in a couple of seconds while the music is still
+  // generating, so the user hears an answer instead of waiting in silence.
+  if (strlen(speech) > 0) {
+    appState = SPEAKING;
+    displayDirty = true;
+    redrawDisplay();
+    audio.connecttohost(speech);
+    return;
+  }
+
+  // No voice (TTS failed, or a volume/transport command with nothing to say).
+  if (musicPending) { fetchTrack = true; return; }
+  appState = IDLE; displayDirty = true;
+}
+
+// Ask the backend for the track it has been generating since the POST. Blocks
+// until it is ready, which by now is usually immediate.
+void fetchAndPlayTrack() {
+  fetchTrack = false;
+  musicPending = false;
+
+  appState = PROCESSING;
+  redrawDisplay();
+
+  HTTPClient http;
+  WiFiClient client;
+  http.begin(client, String(BACKEND_URL) + "/track");
+  http.setTimeout(180000);
+
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    Serial.printf("GET /track -> HTTP %d\n", code);
+    appState = IDLE; displayDirty = true; return;
+  }
+
+  String body = http.getString();
+  http.end();
+
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) {
+    Serial.println("track JSON parse error");
+    appState = IDLE; displayDirty = true; return;
+  }
+
+  const char* url = doc["audio_url"] | "";
+  const char* scr = doc["screen"]    | "";
+  if (scr[0]) snprintf(screenText, sizeof(screenText), "%s", scr);
+  Serial.printf("track: %s\n", url);
+
   if (strlen(url) == 0) { appState = IDLE; displayDirty = true; return; }
 
   appState = PLAYING;
@@ -231,8 +301,13 @@ void sendAndPlay() {
   audio.connecttohost(url);
 }
 
-// Weak-linked by ESP32-audioI2S; fires when the stream ends.
+// Weak-linked by ESP32-audioI2S; fires when a stream ends. Runs in the audio
+// path, so it only sets a flag — the HTTP call happens back in loop().
 void audio_eof_mp3(const char* info) {
+  if (appState == SPEAKING && musicPending) {
+    fetchTrack = true;      // reply finished; go collect the music
+    return;
+  }
   Serial.println("Playback finished");
   appState = IDLE;
   displayDirty = true;
@@ -267,11 +342,11 @@ void setup() {
   // -10025 here means the partition scheme has no SPIFFS partition to format.
   if (!SPIFFS.begin(true)) Serial.println("SPIFFS mount failed");
 
-  audio.setPinout(P2_IO1, P2_IO2, P2_IO0);
+  audio.setPinout(AMP_BCLK, AMP_LRC, AMP_DIN);
 
   appState = IDLE;
   displayDirty = true;
-  Serial.println("Ready — hold P4 button to record");
+  Serial.println("Ready — hold the button to record");
 }
 
 // ── loop ────────────────────────────────────────────────────────────────────
@@ -290,8 +365,15 @@ void loop() {
   bool released = (btnLast == LOW  && btnNow == HIGH);
   btnLast = btnNow;
 
-  // PLAYING is included so a follow-up command can interrupt the track.
-  if (pressed && (appState == IDLE || appState == PLAYING)) beginRecording();
+  // Collect the music once the spoken reply has finished.
+  if (fetchTrack) fetchAndPlayTrack();
+
+  // PLAYING and SPEAKING are included so a follow-up command can interrupt.
+  if (pressed && (appState == IDLE || appState == PLAYING || appState == SPEAKING)) {
+    musicPending = false;   // abandon whatever was queued; a new request supersedes it
+    fetchTrack = false;
+    beginRecording();
+  }
   if (released && appState == RECORDING) sendAndPlay();
 
   if (appState == RECORDING && recFile && micActive) {

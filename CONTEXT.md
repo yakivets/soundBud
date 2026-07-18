@@ -16,10 +16,29 @@ no second firmware, no pairing, and no device-to-device protocol.
 
 | Path | What it is |
 |---|---|
-| `backend/main.py` | FastAPI. `POST /utterance` takes a raw WAV, transcribes it, asks Claude what the user meant, generates a track, returns JSON. |
+| `backend/main.py` | FastAPI. `POST /utterance` takes a raw WAV and returns a spoken reply; `GET /track` hands over the music once it is ready. |
 | `backend/talk.py` | Laptop stand-in for the device — same contract, useful when the hardware is not on the bench. |
 | `firmware/soundbud/` | Arduino sketch. Copy `secrets.h.example` to `secrets.h` first. |
 | `cad/plates.py` | CadQuery script deriving sandwich-mount plates from the vendor STEP. |
+
+### The reply comes back before the music
+
+Generation takes 10-15 seconds, which is a long silence to sit through. So the
+request is split in two:
+
+```
+POST /utterance ──► transcribe, ask Claude, START generating in background
+                    voice Claude's reply with TTS  (~2s)
+                └─► {say, screen, speech_url, music_pending: true}   ~5s total
+
+        device plays the spoken reply while the track finishes generating
+
+GET /track ─────► blocks on the in-flight generation, usually already done
+                └─► {audio_url}
+```
+
+The user hears an answer at ~5s instead of nothing until ~15s. `say` was always
+meant to cover generation latency; returning it after generation defeated that.
 
 ### Two facts worth not rediscovering
 
