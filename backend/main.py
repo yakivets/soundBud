@@ -135,6 +135,11 @@ never to override them.
   good; "it is 19°C and dim so here is jazz" is not — nobody wants their
   thermostat narrating.
 
+Weather is the strongest signal you get. Rain, fog and overcast skies want
+something different from clear sun — lean into it for open-ended requests.
+Indoor temperature and outdoor temperature are given separately and can disagree;
+that is normal, and the outdoor one usually says more about the mood.
+
 When you are given a location, work out where that is and let the region colour
 open-ended requests: the same "play something" should lean flamenco guitar and
 rumba in Spain, and something more UK — garage, trip hop, folk — in London. Treat
@@ -203,6 +208,22 @@ LIGHT_INVERTED = False
 # no GPS at all. A real fix overrides it.
 HOME_PLACE = os.getenv("SOUNDBUD_PLACE", "")
 
+# Open-Meteo: free, no API key. Geocoding turns SOUNDBUD_PLACE into coordinates
+# once; the forecast is cached because weather does not change in the seconds
+# between two voice commands, and this call sits in the latency path.
+OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
+GEOCODE = "https://geocoding-api.open-meteo.com/v1/search"
+WEATHER_TTL = 900.0     # 15 minutes
+_geo_cache: dict[str, tuple[float, float, str]] = {}
+_weather: tuple[float, str] = (0.0, "")   # (fetched_at, description)
+
+# WMO weather codes, collapsed to what matters for choosing music.
+WMO = [
+    (0, "clear"), (1, "mostly clear"), (2, "partly cloudy"), (3, "overcast"),
+    (48, "foggy"), (57, "drizzling"), (67, "raining"), (77, "snowing"),
+    (82, "heavy rain"), (86, "snowing"), (99, "thunderstorms"),
+]
+
 
 # ─── steps ──────────────────────────────────────────────────────────────────
 
@@ -216,6 +237,61 @@ def transcribe(wav: bytes) -> str:
     )
     r.raise_for_status()
     return r.json()["text"].strip()
+
+
+def locate() -> tuple[float, float, str] | None:
+    """Coordinates and place name. A GPS fix wins; otherwise geocode the
+    configured home once and remember it."""
+    if ambient and ambient.has_fix and ambient.lat is not None:
+        return ambient.lat, ambient.lon, ""
+    if not HOME_PLACE:
+        return None
+    if HOME_PLACE not in _geo_cache:
+        # The geocoder wants a bare city name — "London, UK" returns nothing.
+        query = HOME_PLACE.split(",")[0].strip()
+        try:
+            r = httpx.get(GEOCODE, params={"name": query, "count": 1}, timeout=10.0)
+            hit = r.json()["results"][0]
+            _geo_cache[HOME_PLACE] = (hit["latitude"], hit["longitude"],
+                                      f"{hit['name']}, {hit['country']}")
+            print(f"geocoded {HOME_PLACE!r} -> {_geo_cache[HOME_PLACE]}")
+        except Exception as exc:
+            # Keep the name so regional flavour still works; only weather is lost.
+            print(f"geocode failed for {HOME_PLACE!r}: {exc}")
+            _geo_cache[HOME_PLACE] = (0.0, 0.0, HOME_PLACE)   # cached: don't retry per request
+    return _geo_cache[HOME_PLACE]
+
+
+def weather_now() -> str:
+    """Outside conditions in plain English. Cached, and never fatal — losing the
+    weather should degrade the vibe, not break the request."""
+    global _weather
+    fetched, text = _weather
+    if time.time() - fetched < WEATHER_TTL:
+        return text
+
+    here = locate()
+    if here is None:
+        return ""
+    lat, lon, _ = here
+    if not lat and not lon:      # geocode failed; we have a name but no coordinates
+        return ""
+    try:
+        r = httpx.get(OPEN_METEO, params={
+            "latitude": lat, "longitude": lon,
+            "current": "temperature_2m,weather_code,wind_speed_10m"}, timeout=10.0)
+        cur = r.json()["current"]
+        code = cur["weather_code"]
+        sky = next(word for limit, word in WMO if code <= limit)
+        text = f"{sky} and {cur['temperature_2m']:.0f}°C outside"
+        if cur["wind_speed_10m"] > 30:
+            text += ", windy"
+    except Exception as exc:
+        print(f"weather lookup failed: {exc}")
+        text = ""
+
+    _weather = (time.time(), text)
+    return text
 
 
 def describe_ambient() -> str:
@@ -236,18 +312,19 @@ def describe_ambient() -> str:
                         else "bright" if level > 3000 else "normal light")
         if ambient.temp_c is not None:
             t = ambient.temp_c
-            bits.append(f"{t:.0f}°C, " + ("cold" if t < 16 else
-                                          "warm" if t > 24 else "mild"))
+            bits.append(f"{t:.0f}°C indoors, " + ("cold" if t < 16 else
+                                                  "warm" if t > 24 else "mild"))
         if ambient.humidity is not None and ambient.humidity > 65:
             bits.append("humid")
 
-    # Coordinates go in raw: the model knows where 51.5,-0.13 is, so this needs
-    # no geocoding service. A GPS fix wins; otherwise fall back to the configured
-    # home, since indoors there is never a fix.
-    if ambient and ambient.has_fix and ambient.lat is not None:
-        bits.append(f"at {ambient.lat:.2f}, {ambient.lon:.2f}")
-    elif HOME_PLACE:
-        bits.append(f"in {HOME_PLACE}")
+    here = locate()
+    if here:
+        lat, lon, name = here
+        bits.append(f"in {name}" if name else f"at {lat:.2f}, {lon:.2f}")
+
+    outside = weather_now()
+    if outside:
+        bits.append(outside)
 
     return ", ".join(bits)
 
