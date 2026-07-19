@@ -239,15 +239,19 @@ Choosing the intent is the most important thing you do:
   "go back", "previous". Set `transport_action` to pause, resume, next or
   previous. "stop" and "pause" both map to pause.
 
-  IMPORTANT: transport controls SPOTIFY, which plays on the user's phone or
-  laptop — not on this speaker. Only choose it when the context says something
-  is on their Spotify right now. Getting this wrong is silent failure: Spotify
-  obeys, the speaker stays quiet, and the user thinks nothing happened.
+  pause and resume ALWAYS use transport, whatever is playing. They reach both
+  Spotify and our own speaker, so "stop", "stop the song", "pause", "turn it
+  off", "shut up" and "carry on" are transport with transport_action pause or
+  resume. Never answer for these — the user asked for silence and expects it.
 
-  When nothing is on their Spotify, playback words mean OUR tracks:
+  next and previous are different: they only work on Spotify, and only when the
+  context says something is playing there. When nothing is on their Spotify,
+  those words mean OUR tracks instead:
     "skip this" / "next"      -> replay with replay_query "another"
     "play the previous song"  -> replay with replay_query "previous"
-  Never answer in these cases — they asked for a change and expect one.
+
+  Getting this wrong is silent failure: the request is acknowledged and nothing
+  in the room changes.
 - spotify_play: the user named a real, existing song or artist and wants THAT
   recording — "play Bohemian Rhapsody", "put on some Radiohead", "play Blue in
   Green by Bill Evans". Set `spotify_query` to what to search for. Do not use it
@@ -612,7 +616,12 @@ def plan_from(utterance: str) -> Plan:
         print("vibe: withheld — request did not ask for it")
     response = claude.messages.parse(
         model=MODEL,
-        max_tokens=1024,
+        # The budget covers reasoning AND the structured output. At 1024 a
+        # deliberated request — "stop the song" is genuinely ambiguous across
+        # transport, replay and Spotify — could exhaust it before the JSON was
+        # complete, and truncated output parses as nothing. Costs nothing when
+        # unused; only generated tokens are billed.
+        max_tokens=4096,
         system=SYSTEM,
         messages=[{
             "role": "user",
