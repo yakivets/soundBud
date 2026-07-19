@@ -20,3 +20,8 @@ backend/.spotify_token.json
 
 # generated track index
 backend/tracks/index.json
+
+# vendor CAD archives — large binaries, download from axiometa.io
+*.zip
+*.step
+*.stl

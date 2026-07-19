@@ -18,8 +18,8 @@ no second firmware, no pairing, and no device-to-device protocol.
 |---|---|
 | `backend/main.py` | FastAPI. `POST /utterance` takes a raw WAV and returns a spoken reply; `GET /track` hands over the music once it is ready. |
 | `backend/talk.py` | Laptop stand-in for the device — same contract, useful when the hardware is not on the bench. |
-| `firmware/soundbud/` | Speaker sketch. Copy `secrets.h.example` to `secrets.h` first. |
-| `firmware/sensors/` | Sensor node sketch. Its own `secrets.h` — separate file, separate project. |
+| `firmware/remote/` | Handheld: button, mic, buzzer, screen. Records and POSTs. |
+| `firmware/base/` | Speaker: amp, matrix, encoder, DHT11. Polls for work. |
 | `cad/plates.py` | CadQuery script deriving sandwich-mount plates from the vendor STEP. |
 
 ### The reply comes back before the music
@@ -135,24 +135,34 @@ From the Axiometa catalogue (checked against the live product pages):
 
 Two boards, both talking only to the backend — never to each other.
 
-**Speaker** (Genesis One) — `firmware/soundbud/`
+**Remote** (Genesis Mini) — `firmware/remote/`
 
 | Port | Module |
 |---|---|
-| P1 | Rotary encoder — volume, push to pause |
-| P2 | IPS LCD 0.96" (ST7735, 160×80) — equaliser while playing |
-| P3 | Button — push to talk |
-| P4 | NeoPixel 5×5 matrix — volume digit / pause glyph |
-| P5 | PDM mic |
-| P8 | MAX98357A amp → speaker |
+| P1 | Button — hold to talk |
+| P2 | Passive buzzer |
+| P3 | IPS LCD 0.96" — status and replies |
+| P4 | PDM mic |
 
-**Sensor node** (Genesis Mini) — `firmware/sensors/`
+**Base** (Genesis One) — `firmware/base/`
 
 | Port | Module |
 |---|---|
-| P1 | DHT11 — indoor temperature and humidity |
-| P3 | GNSS ATGM336H — 115200 baud, never fixes indoors |
-| P4 | IPS LCD 0.96" — in/out conditions |
+| P1 | NeoPixel 5×5 — volume digit / pause glyph |
+| P2 | DHT11 |
+| P4 | Rotary encoder — volume, push to pause |
+| P5 | IPS LCD 0.96" — equaliser while playing |
+| P6 | Passive buzzer |
+| P7 | MAX98357A amp → speaker |
+
+The remote hears, the base plays, and they never talk to each other. `/playback`
+bridges them: the base long-polls it and acts on any `seq` above the last it
+handled. `age_s` guards against a freshly booted board replaying a command from
+before it existed.
+
+**Keep the matrix off P8.** That is GPIO44 / UART0 — serial output gets clocked
+into the LEDs as pixel data, and the symptom is half the matrix flickering with
+digits rendered as scatter.
 
 | Need | Part | Note |
 |---|---|---|
