@@ -408,6 +408,21 @@ ready_track: str | None = None
 # The file the device was last given. "Previous" means the one before this.
 current_file: str | None = None
 
+# ─── playback bridge ────────────────────────────────────────────────────────
+# The remote has the microphone, the base has the speaker, and they never talk
+# to each other. So the base polls here: `seq` changes whenever there is
+# something new to do, which is all the firmware needs to compare against.
+playback: dict = {"seq": 0, "speech_url": None, "audio_url": None,
+                  "screen": "", "volume": 0.6, "keep_playing": False,
+                  "action": ""}
+
+
+def queue_playback(**fields) -> None:
+    playback.update(fields)
+    playback["seq"] += 1
+    print(f"playback #{playback['seq']}: {fields.get('action') or 'play'} "
+          f"{(fields.get('speech_url') or fields.get('audio_url') or '').split('/')[-1]}")
+
 # Last reading from the sensor board, and when it arrived. Stale readings are
 # worse than none — a temperature from this morning is a lie about right now.
 ambient: Ambient | None = None
@@ -731,6 +746,23 @@ def generate_music(prompt: str, duration_seconds: int = 120,
     return url
 
 
+@app.get("/playback")
+def playback_state(since: int = -1):
+    """What the base should be doing. Polled once a second by the speaker board.
+
+    `seq` increases whenever there is something new. The device keeps the last
+    seq it acted on and ignores anything not greater — so a missed poll costs
+    nothing and a repeated one does not replay the same track.
+
+    Long-polls for up to 25s when `since` matches, so a quiet system is one open
+    connection rather than a request every second.
+    """
+    deadline = time.time() + 25.0
+    while playback["seq"] <= since and time.time() < deadline:
+        time.sleep(0.25)
+    return playback
+
+
 @app.get("/history")
 def history(limit: int = 30):
     """Everything generated so far, newest first."""
@@ -937,6 +969,13 @@ async def utterance(request: Request, volume_now: float | None = None):
         # Losing the voice is survivable — the screen still says what happened.
         print(f"tts failed: {exc}")
 
+    # Publish for the base to collect. The remote holds the microphone and has
+    # no speaker, so whatever it hears has to reach the other board through here.
+    queue_playback(speech_url=speech_url, audio_url=None, screen=screen,
+                   volume=round(volume, 2), keep_playing=keep_playing,
+                   action="speak" if speech_url else "",
+                   music_pending=generating)
+
     return {
         "say": spoken,
         "screen": screen,
@@ -1132,8 +1171,12 @@ def track(request: Request):
         name, ready_track = ready_track, None
         current_file = name
         print(f"serving from library: {name}")
-        return {"audio_url": f"{str(request.base_url).rstrip('/')}/tracks/{name}",
-                "screen": now_playing or "Playing",
+        url = f"{str(request.base_url).rstrip('/')}/tracks/{name}"
+        queue_playback(speech_url=None, audio_url=url,
+                       screen=now_playing or "Playing", volume=round(volume, 2),
+                       keep_playing=keep_playing, action="play",
+                       music_pending=False)
+        return {"audio_url": url, "screen": now_playing or "Playing",
                 "keep_playing": keep_playing}
     if pending is None:
         return {"audio_url": None, "screen": "Nothing queued"}
