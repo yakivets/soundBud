@@ -230,9 +230,13 @@ Choosing the intent is the most important thing you do:
   "the lo-fi one from earlier", "put that jazz track back on". Set
   `replay_query` to what to look for: a genre, a mood, or "" for the most
   recent. Nothing is generated, so this is instant and free.
-- keep_playing: "keep playing", "keep it going", "don't stop", "autoplay" turns
-  it ON (`keep_playing` true); "stop after this", "just this one" turns it OFF.
-  When on, a new track is made automatically as each one ends.
+- keep_playing: "keep playing", "keep it going", "don't stop", "autoplay",
+  "continue the same vibe" turns it ON (`keep_playing` true); "stop after this",
+  "just this one" turns it OFF. When on, a new track is made automatically as
+  each one ends.
+  ALSO fill in `track` when turning it on, exactly as you would for new_track —
+  turning autoplay on starts music immediately. If something is already playing,
+  base it on that. If nothing is, pick something that suits.
 - answer: a QUESTION that needs no action — "what is this song?", "who sings
   this?", "what's playing?", "what can you do?". Put the reply in `say` and
   change nothing. A question is never a request to play something: "what is this
@@ -800,27 +804,16 @@ async def utterance(request: Request, volume_now: float | None = None):
 
     current_track, volume, needs_generation = apply(plan, current_track, volume)
 
-    # What the track would be, in words. Useful on the screen while there is no
-    # speaker, and useful for debugging once there is one.
-    music = current_track.prompt if needs_generation else None
-
     # base_url is whatever host the device reached us on, so URLs are already the
     # right LAN address without configuring it anywhere.
     base = str(request.base_url).rstrip("/")
 
-    # Start the music first so it generates while the reply is being voiced.
-    generating = needs_generation and GENERATE_AUDIO
-    if generating:
-        track = current_track
-        now_playing = plan.screen[:20]
-        pending = _pool.submit(lambda: generate(track))
-    elif music:
-        print(f"music (not generated): {music}")
-
-    # Spotify plays on the user's own phone or laptop — there is no stream for
-    # this device — so the only thing to return is a spoken account of what
-    # happened, including when it could not.
+    # Every intent below may change what we say, and whether there is anything
+    # for the device to collect afterwards. Decide all of that first, then start
+    # the generation, so nothing is queued before we know it is wanted.
     spoken = plan.say
+    screen = plan.screen[:20]
+    generating = False
 
     # Replay is instant, but it still goes out through /track so the device can
     # use the flow it already knows: speak the reply, then come and collect.
@@ -838,6 +831,20 @@ async def utterance(request: Request, volume_now: float | None = None):
     if plan.intent == "keep_playing" and plan.keep_playing is not None:
         keep_playing = plan.keep_playing
         print(f"keep playing: {'on' if keep_playing else 'off'}")
+        # Turning it on has to start something, or it is a switch that appears
+        # to do nothing: the follow-up is only queued when a track is handed
+        # over, and none ever is until one plays.
+        if keep_playing:
+            seed = plan.track or current_track
+            if seed and GENERATE_AUDIO:
+                current_track = seed
+                now_playing = (plan.screen or seed.label or "Playing")[:20]
+                pending = _pool.submit(lambda: generate(seed))
+                generating = True
+                print(f"keep playing: first track queued :: {seed.prompt[:60]}")
+            else:
+                spoken = ("Autoplay is on. Ask for something and I will keep it "
+                          "going from there.")
 
     if plan.intent == "transport" and plan.transport_action:
         result = spotify_control(plan.transport_action)
@@ -850,6 +857,19 @@ async def utterance(request: Request, volume_now: float | None = None):
         spoken = spotify_play(plan.spotify_query)
         print(f"spotify_play({plan.spotify_query!r}) -> {spoken}")
 
+    # What the track would be, in words. Useful on the screen while there is no
+    # speaker, and useful for debugging once there is one.
+    music = current_track.prompt if needs_generation else None
+
+    # Now start the music, so it generates while the reply is being voiced.
+    if needs_generation and GENERATE_AUDIO and pending is None:
+        track = current_track
+        now_playing = screen
+        pending = _pool.submit(lambda: generate(track))
+        generating = True
+    elif music:
+        print(f"music (not generated): {music}")
+
     speech_url = None
     try:
         speech_url = f"{base}/tracks/{speak(spoken)}"
@@ -859,7 +879,7 @@ async def utterance(request: Request, volume_now: float | None = None):
 
     return {
         "say": spoken,
-        "screen": plan.screen[:20],
+        "screen": screen,
         "music": music,
         "speech_url": speech_url,
         "keep_playing": keep_playing,
