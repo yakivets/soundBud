@@ -416,7 +416,8 @@ playback: dict = {"seq": 0, "speech_url": None, "audio_url": None,
                   "screen": "", "volume": 0.6, "keep_playing": False,
                   "action": "", "music_pending": False,
                   # For the remote's display — it has a screen but no speaker.
-                  "now_playing": "", "state": "idle", "at": 0.0}
+                  "now_playing": "", "state": "idle", "at": 0.0,
+                  "set_volume": False}
 
 
 def queue_playback(**fields) -> None:
@@ -1020,11 +1021,26 @@ async def utterance(request: Request, volume_now: float | None = None):
     # Any new utterance supersedes whatever is playing. Without this the base
     # keeps the old track running underneath the new one, which is exactly what
     # "play another song" is asking it not to do.
+    # A volume change must not disturb playback — it gets its own action so the
+    # base applies it and leaves the current stream alone. Without this it took
+    # the "supersedes everything" path and stopped the music.
+    volume_only = plan.intent == "set_volume"
+    if volume_only:
+        action = "volume"
+    elif stop_action:
+        action = stop_action
+    elif speech_url:
+        action = "speak"
+    else:
+        action = "stop"
+
     queue_playback(speech_url=speech_url, audio_url=None, screen=screen,
                    volume=round(volume, 2), keep_playing=keep_playing,
-                   action=stop_action or ("speak" if speech_url else "stop"),
-                   music_pending=generating,
+                   action=action, music_pending=generating,
                    now_playing=now_playing or "",
+                   # set_volume was in the /utterance reply but never here, so
+                   # the base never applied it — the volume silently never moved.
+                   set_volume=volume_only,
                    state="speaking" if speech_url else "idle")
 
     return {
@@ -1226,8 +1242,8 @@ def track(request: Request):
         queue_playback(speech_url=None, audio_url=url,
                        screen=now_playing or "Playing", volume=round(volume, 2),
                        keep_playing=keep_playing, action="play",
-                       music_pending=False, now_playing=now_playing or "",
-                       state="playing")
+                       music_pending=False, set_volume=False,
+                       now_playing=now_playing or "", state="playing")
         return {"audio_url": url, "screen": now_playing or "Playing",
                 "keep_playing": keep_playing}
     if pending is None:
