@@ -129,14 +129,20 @@ def find_in_library(want: str) -> dict | None:
     Generation costs 15 seconds and real money; if we already made something
     that fits, playing it back beats making a near-duplicate.
     """
+    # Only offer tracks whose file is still on disk — the index outlives cleanups.
+    entries = [e for e in library() if (TRACKS / e["file"]).exists()]
+    if not entries:
+        return None
+
     want = want.lower().strip()
     if not want:
-        return None
-    for entry in library():                      # newest first
+        return entries[0]        # "play that again" means the most recent one
+
+    for entry in entries:                        # newest first
         if want in entry["genre"] or want in entry["label"].lower():
             return entry
     words = {w for w in want.split() if len(w) > 3}
-    for entry in library():
+    for entry in entries:
         if words & set(entry["prompt"].lower().split()):
             return entry
     return None
@@ -343,6 +349,10 @@ pending: Future | None = None
 # When on, a fresh track is queued the moment one is handed over, so the next is
 # already generating while the current plays and the room never goes quiet.
 keep_playing: bool = False
+# A library track ready to hand over immediately. Replay reuses the normal
+# two-step flow — reply, then GET /track — rather than inventing a second
+# channel the firmware would have to learn.
+ready_track: str | None = None
 
 # Last reading from the sensor board, and when it arrived. Stale readings are
 # worse than none — a temperature from this morning is a lie about right now.
@@ -770,7 +780,7 @@ async def utterance(request: Request, volume_now: float | None = None):
     """`volume_now` is the device's actual 0..1 level, which the knob can change
     without telling us. Trust it over our own copy, or "turn it down" is computed
     from a stale number."""
-    global current_track, volume, now_playing
+    global current_track, volume, now_playing, ready_track, keep_playing, pending
     if volume_now is not None:
         volume = min(1.0, max(0.0, volume_now))
 
@@ -799,7 +809,6 @@ async def utterance(request: Request, volume_now: float | None = None):
     base = str(request.base_url).rstrip("/")
 
     # Start the music first so it generates while the reply is being voiced.
-    global pending
     generating = needs_generation and GENERATE_AUDIO
     if generating:
         track = current_track
@@ -813,19 +822,20 @@ async def utterance(request: Request, volume_now: float | None = None):
     # happened, including when it could not.
     spoken = plan.say
 
-    # Replay costs nothing and takes no time — hand the file straight back.
-    replayed = None
+    # Replay is instant, but it still goes out through /track so the device can
+    # use the flow it already knows: speak the reply, then come and collect.
     if plan.intent == "replay":
         hit = find_in_library(plan.replay_query or "")
         if hit:
-            replayed = f"{base}/tracks/{hit['file']}"
-            screen = (hit["label"] or plan.screen)[:20]
-            print(f"replay: {hit['file']} ({hit['genre']})")
+            ready_track = hit["file"]
+            now_playing = (hit["label"] or hit["genre"] or "Replay")[:20]
+            screen = now_playing
+            generating = True          # tells the device to fetch /track
+            print(f"replay: {hit['file']} ({hit['genre'] or 'no genre'})")
         else:
             spoken = "I could not find that one. Want me to make something new?"
 
     if plan.intent == "keep_playing" and plan.keep_playing is not None:
-        global keep_playing
         keep_playing = plan.keep_playing
         print(f"keep playing: {'on' if keep_playing else 'off'}")
 
@@ -852,8 +862,6 @@ async def utterance(request: Request, volume_now: float | None = None):
         "screen": plan.screen[:20],
         "music": music,
         "speech_url": speech_url,
-        # Replay has audio ready immediately, so the device can skip /track.
-        "replay_url": replayed,
         "keep_playing": keep_playing,
         # True means: play the speech, then GET /track for the music.
         "music_pending": generating,
@@ -1039,11 +1047,16 @@ def track(request: Request):
     deliberate — by then the track is usually already done, and a blocking read is
     far less firmware than a polling loop.
     """
-    global pending
+    global pending, ready_track, keep_playing
+    if ready_track:
+        name, ready_track = ready_track, None
+        print(f"serving from library: {name}")
+        return {"audio_url": f"{str(request.base_url).rstrip('/')}/tracks/{name}",
+                "screen": now_playing or "Playing",
+                "keep_playing": keep_playing}
     if pending is None:
         return {"audio_url": None, "screen": "Nothing queued"}
 
-    global keep_playing
     try:
         name = pending.result(timeout=GENERATION_TIMEOUT)
     except Exception as exc:
