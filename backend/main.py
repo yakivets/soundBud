@@ -82,7 +82,7 @@ WAV_HEADER_BYTES = 44
 
 # Stock ElevenLabs voice. flash_v2_5 because this sits directly in front of the
 # user — quality matters less than getting a reply out while music generates.
-VOICE_ID = os.getenv("SOUNDBUD_VOICE", "QTGiyJvep6bcx4WD1qAq")
+VOICE_ID = os.getenv("SOUNDBUD_VOICE", "st7NwhTPEzqo2riw7qWC")
 TTS_MODEL = "eleven_flash_v2_5"
 
 # ─── Spotify ────────────────────────────────────────────────────────────────
