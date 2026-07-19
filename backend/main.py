@@ -31,9 +31,13 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 
 ELEVEN = "https://api.elevenlabs.io/v1"
 
-# Cheapest Anthropic model that still does structured outputs. Intent
-# classification is an easy task and this call sits in the latency path.
-MODEL = "claude-haiku-4-5"
+# Sonnet, not Haiku. Intent classification looked easy with four intents and
+# stopped being easy at eight: Haiku scored 8/10 on the real phrasings people
+# use ("could you skip this one", "play that again") against Sonnet's 10/10.
+# It costs about 2s more, but that lands inside a wait the user already has —
+# generation takes 12-15s — and a misread intent means the device silently does
+# nothing, which is the failure that actually gets reported.
+MODEL = os.getenv("SOUNDBUD_MODEL", "claude-sonnet-5")
 TRACKS = Path(__file__).parent / "tracks"
 TRACKS.mkdir(exist_ok=True)
 
@@ -123,7 +127,13 @@ def remember(file: str, prompt: str, genre: str, label: str) -> None:
     INDEX_FILE.write_text(json.dumps(entries[:200], indent=1))
 
 
-def find_in_library(want: str) -> dict | None:
+# "the previous one" must not resolve to the track currently playing, or a
+# replay sounds like a restart — which is exactly what it did.
+BEFORE_THIS = ("previous", "before", "last one", "earlier", "one before",
+               "another", "different", "other")
+
+
+def find_in_library(want: str, exclude: str | None = None) -> dict | None:
     """Best existing track for a genre or description, or None.
 
     Generation costs 15 seconds and real money; if we already made something
@@ -131,12 +141,24 @@ def find_in_library(want: str) -> dict | None:
     """
     # Only offer tracks whose file is still on disk — the index outlives cleanups.
     entries = [e for e in library() if (TRACKS / e["file"]).exists()]
+    want = want.lower().strip()
+
+    # "play the previous one" means step back past whatever is playing now.
+    stepping_back = any(w in want for w in BEFORE_THIS)
+    if stepping_back and exclude:
+        entries = [e for e in entries if e["file"] != exclude]
     if not entries:
         return None
 
-    want = want.lower().strip()
+    # Strip the positional words so "the previous lo-fi one" still searches for
+    # lo-fi, and a bare "previous" is left meaning "newest of what remains".
+    for word in BEFORE_THIS:
+        want = want.replace(word, " ")
+    want = " ".join(want.replace("one", " ").replace("song", " ")
+                    .replace("track", " ").split()).strip()
+
     if not want:
-        return entries[0]        # "play that again" means the most recent one
+        return entries[0]        # newest, or newest-but-current if stepping back
 
     for entry in entries:                        # newest first
         if want in entry["genre"] or want in entry["label"].lower():
@@ -145,7 +167,11 @@ def find_in_library(want: str) -> dict | None:
     for entry in entries:
         if words & set(entry["prompt"].lower().split()):
             return entry
-    return None
+
+    # Nothing matched the words, but if they asked for an earlier track then
+    # "an earlier track" is itself the request — leftovers like "you made" or
+    # "this" are noise, not search terms.
+    return entries[0] if stepping_back else None
 
 claude = anthropic.Anthropic()
 
@@ -211,8 +237,17 @@ Choosing the intent is the most important thing you do:
 - new_track: a fresh request unrelated to what's playing. This GENERATES music.
 - transport: playback control — "skip", "next", "stop", "pause", "resume",
   "go back", "previous". Set `transport_action` to pause, resume, next or
-  previous. "stop" and "pause" both map to pause. This controls whatever is
-  playing, including Spotify.
+  previous. "stop" and "pause" both map to pause.
+
+  IMPORTANT: transport controls SPOTIFY, which plays on the user's phone or
+  laptop — not on this speaker. Only choose it when the context says something
+  is on their Spotify right now. Getting this wrong is silent failure: Spotify
+  obeys, the speaker stays quiet, and the user thinks nothing happened.
+
+  When nothing is on their Spotify, playback words mean OUR tracks:
+    "skip this" / "next"      -> replay with replay_query "another"
+    "play the previous song"  -> replay with replay_query "previous"
+  Never answer in these cases — they asked for a change and expect one.
 - spotify_play: the user named a real, existing song or artist and wants THAT
   recording — "play Bohemian Rhapsody", "put on some Radiohead", "play Blue in
   Green by Bill Evans". Set `spotify_query` to what to search for. Do not use it
@@ -226,10 +261,15 @@ Choosing the intent is the most important thing you do:
   the real life" becomes "Bohemian Rhapsody Queen". If you genuinely cannot place
   it, put the best search terms you can and say in `say` that you are guessing.
 
-- replay: the user wants something they have heard before — "play that again",
-  "the lo-fi one from earlier", "put that jazz track back on". Set
-  `replay_query` to what to look for: a genre, a mood, or "" for the most
-  recent. Nothing is generated, so this is instant and free.
+- replay: the user wants a track WE generated earlier — "play that again", "the
+  lo-fi one from earlier", "the previous song you made", "put that jazz track
+  back on". Set `replay_query` to what to look for: a genre, a mood, "previous"
+  for the one before what is playing, or "" for the most recent. Nothing is
+  generated, so this is instant and free.
+
+  Keep the user's own wording in `replay_query` when they say "previous",
+  "earlier" or "the one before" — that is what steps back past the current
+  track instead of restarting it.
 - keep_playing: "keep playing", "keep it going", "don't stop", "autoplay",
   "continue the same vibe" turns it ON (`keep_playing` true); "stop after this",
   "just this one" turns it OFF. When on, a new track is made automatically as
@@ -242,9 +282,17 @@ Choosing the intent is the most important thing you do:
   change nothing. A question is never a request to play something: "what is this
   song" must not restart it.
 
-  Only for actual questions. A command is not a question: "skip this" is
-  transport, "play that again" is replay. If the user is telling you to do
-  something, do it.
+  Only when the user wants INFORMATION and nothing else. Politeness is not a
+  question — this is a voice device, people phrase requests as questions all the
+  time and they still expect action:
+
+    "can you play the previous song?"  -> replay, NOT answer
+    "could you skip this?"             -> transport, NOT answer
+    "would you turn it down?"          -> set_volume, NOT answer
+    "what is this song?"               -> answer (they want to be told)
+
+  Test it this way: if doing nothing but talking would disappoint them, it is
+  not answer. Choose answer only when there is genuinely nothing to do.
 
 Deciding between new_track and spotify_play is the second most important call you
 make. A named song or artist is spotify_play. A description is new_track. A
@@ -357,6 +405,8 @@ keep_playing: bool = False
 # two-step flow — reply, then GET /track — rather than inventing a second
 # channel the firmware would have to learn.
 ready_track: str | None = None
+# The file the device was last given. "Previous" means the one before this.
+current_file: str | None = None
 
 # Last reading from the sensor board, and when it arrived. Stale readings are
 # worse than none — a temperature from this morning is a lie about right now.
@@ -784,7 +834,7 @@ async def utterance(request: Request, volume_now: float | None = None):
     """`volume_now` is the device's actual 0..1 level, which the knob can change
     without telling us. Trust it over our own copy, or "turn it down" is computed
     from a stale number."""
-    global current_track, volume, now_playing, ready_track, keep_playing, pending
+    global current_track, volume, now_playing, ready_track, keep_playing, pending, current_file
     if volume_now is not None:
         volume = min(1.0, max(0.0, volume_now))
 
@@ -818,7 +868,7 @@ async def utterance(request: Request, volume_now: float | None = None):
     # Replay is instant, but it still goes out through /track so the device can
     # use the flow it already knows: speak the reply, then come and collect.
     if plan.intent == "replay":
-        hit = find_in_library(plan.replay_query or "")
+        hit = find_in_library(plan.replay_query or "", exclude=current_file)
         if hit:
             ready_track = hit["file"]
             now_playing = (hit["label"] or hit["genre"] or "Replay")[:20]
@@ -851,8 +901,12 @@ async def utterance(request: Request, volume_now: float | None = None):
         print(f"transport {plan.transport_action} -> {result}")
         # Only speak Spotify's answer when it actually did something; otherwise
         # keep Claude's reply, since the device controls its own playback.
-        if not result.startswith(("Spotify is not", "No active")):
-            spoken = result
+        if result.startswith(("Spotify is not", "No active")):
+            # Do not report success the user cannot hear.
+            spoken = ("Nothing is playing on Spotify. Say \"play the previous "
+                      "song you made\" if you meant one of mine.")
+        else:
+            spoken = f"{result} On your Spotify."
     if plan.intent == "spotify_play" and plan.spotify_query:
         spoken = spotify_play(plan.spotify_query)
         print(f"spotify_play({plan.spotify_query!r}) -> {spoken}")
@@ -1067,9 +1121,10 @@ def track(request: Request):
     deliberate — by then the track is usually already done, and a blocking read is
     far less firmware than a polling loop.
     """
-    global pending, ready_track, keep_playing
+    global pending, ready_track, keep_playing, current_file
     if ready_track:
         name, ready_track = ready_track, None
+        current_file = name
         print(f"serving from library: {name}")
         return {"audio_url": f"{str(request.base_url).rstrip('/')}/tracks/{name}",
                 "screen": now_playing or "Playing",
@@ -1084,6 +1139,7 @@ def track(request: Request):
         return {"audio_url": None, "screen": "Failed - retry"}
     finally:
         pending = None
+    current_file = name
 
     # Queue the follow-up now, so it generates while this one plays. By the time
     # the device asks again it is usually already waiting.
