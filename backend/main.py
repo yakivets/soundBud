@@ -416,12 +416,13 @@ playback: dict = {"seq": 0, "speech_url": None, "audio_url": None,
                   "screen": "", "volume": 0.6, "keep_playing": False,
                   "action": "", "music_pending": False,
                   # For the remote's display — it has a screen but no speaker.
-                  "now_playing": "", "state": "idle"}
+                  "now_playing": "", "state": "idle", "at": 0.0}
 
 
 def queue_playback(**fields) -> None:
     playback.update(fields)
     playback["seq"] += 1
+    playback["at"] = time.time()
     print(f"playback #{playback['seq']}: {fields.get('action') or 'play'} "
           f"{(fields.get('speech_url') or fields.get('audio_url') or '').split('/')[-1]}")
 
@@ -467,7 +468,11 @@ def transcribe(wav: bytes) -> str:
         data={"model_id": "scribe_v1"},
         timeout=60.0,
     )
-    r.raise_for_status()
+    if r.status_code >= 400:
+        # Almost always a clip that is too short or a malformed WAV. Log what
+        # ElevenLabs actually said — "400" alone tells us nothing.
+        print(f"transcribe failed {r.status_code}: {r.text[:300]}")
+        raise HTTPException(422, "could not transcribe that audio")
     return r.json()["text"].strip()
 
 
@@ -773,7 +778,11 @@ def playback_state(since: int = -1):
     deadline = time.time() + 25.0
     while playback["seq"] <= since and time.time() < deadline:
         time.sleep(0.25)
-    return playback
+    # A device that just booted must not act on a command from before it existed.
+    # It starts at since=-1, so without this it would replay whatever was last
+    # queued — which is exactly what happens after a reset.
+    return {**playback, "age_s": round(time.time() - playback["at"], 1)
+                        if playback["at"] else 9999}
 
 
 @app.get("/history")
@@ -891,8 +900,28 @@ async def utterance(request: Request, volume_now: float | None = None):
     if len(wav) < WAV_HEADER_BYTES or wav[:4] != b"RIFF" or wav[8:12] != b"WAVE":
         raise HTTPException(400, "expected raw WAV bytes as the request body")
 
-    text = transcribe(wav)
+    # A rejected recording must not 500 the device — it should hear why.
+    try:
+        text = transcribe(wav)
+    except HTTPException:
+        spoken = "Sorry, I did not catch that. Hold the button a little longer."
+        speech_url = None
+        try:
+            speech_url = f"{str(request.base_url).rstrip('/')}/tracks/{speak(spoken)}"
+        except httpx.HTTPError:
+            pass
+        queue_playback(speech_url=speech_url, audio_url=None, screen="Say again?",
+                       volume=round(volume, 2), keep_playing=keep_playing,
+                       action="speak" if speech_url else "", music_pending=False,
+                       now_playing=now_playing or "", state="speaking")
+        return {"say": spoken, "screen": "Say again?", "music": None,
+                "speech_url": speech_url, "keep_playing": keep_playing,
+                "music_pending": False, "audio_url": None,
+                "volume": round(volume, 2), "set_volume": False}
+
     print(f"heard: {text!r}")
+    if len(text) < 2:
+        print("transcript empty — likely silence or a very short press")
 
     plan = plan_from(text)
     print(f"intent: {plan.intent}")
