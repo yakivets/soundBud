@@ -414,7 +414,9 @@ current_file: str | None = None
 # something new to do, which is all the firmware needs to compare against.
 playback: dict = {"seq": 0, "speech_url": None, "audio_url": None,
                   "screen": "", "volume": 0.6, "keep_playing": False,
-                  "action": ""}
+                  "action": "", "music_pending": False,
+                  # For the remote's display — it has a screen but no speaker.
+                  "now_playing": "", "state": "idle"}
 
 
 def queue_playback(**fields) -> None:
@@ -612,7 +614,18 @@ def plan_from(utterance: str) -> Plan:
         }],
         output_format=Plan,
     )
-    return response.parsed_output
+    plan = response.parsed_output
+    if plan is None:
+        # The model declined to produce a Plan — refusal, or a stop reason that
+        # left nothing parsed. A 500 here strands the device mid-conversation,
+        # so fall back to something it can act on.
+        print(f"planner returned nothing for {utterance!r}; treating as answer")
+        return Plan(intent="answer", volume=None, track=None, spotify_query=None,
+                    transport_action=None, genre=None, replay_query=None,
+                    keep_playing=None,
+                    say="Sorry, I did not catch that. Say it again?",
+                    screen="Say again?")
+    return plan
 
 
 def strip_names(prompt: str) -> str:
@@ -896,6 +909,7 @@ async def utterance(request: Request, volume_now: float | None = None):
     spoken = plan.say
     screen = plan.screen[:20]
     generating = False
+    stop_action = ""          # "pause"/"resume" for our own speaker
 
     # Replay is instant, but it still goes out through /track so the device can
     # use the flow it already knows: speak the reply, then come and collect.
@@ -931,6 +945,9 @@ async def utterance(request: Request, volume_now: float | None = None):
     if plan.intent == "transport" and plan.transport_action:
         result = spotify_control(plan.transport_action)
         print(f"transport {plan.transport_action} -> {result}")
+        # Whatever Spotify did, a pause also has to reach our own speaker.
+        if plan.transport_action in ("pause", "resume"):
+            stop_action = plan.transport_action
         # Only speak Spotify's answer when it actually did something; otherwise
         # keep Claude's reply, since the device controls its own playback.
         if result.startswith(("Spotify is not", "No active")):
@@ -971,10 +988,15 @@ async def utterance(request: Request, volume_now: float | None = None):
 
     # Publish for the base to collect. The remote holds the microphone and has
     # no speaker, so whatever it hears has to reach the other board through here.
+    # Any new utterance supersedes whatever is playing. Without this the base
+    # keeps the old track running underneath the new one, which is exactly what
+    # "play another song" is asking it not to do.
     queue_playback(speech_url=speech_url, audio_url=None, screen=screen,
                    volume=round(volume, 2), keep_playing=keep_playing,
-                   action="speak" if speech_url else "",
-                   music_pending=generating)
+                   action=stop_action or ("speak" if speech_url else "stop"),
+                   music_pending=generating,
+                   now_playing=now_playing or "",
+                   state="speaking" if speech_url else "idle")
 
     return {
         "say": spoken,
@@ -1175,7 +1197,8 @@ def track(request: Request):
         queue_playback(speech_url=None, audio_url=url,
                        screen=now_playing or "Playing", volume=round(volume, 2),
                        keep_playing=keep_playing, action="play",
-                       music_pending=False)
+                       music_pending=False, now_playing=now_playing or "",
+                       state="playing")
         return {"audio_url": url, "screen": now_playing or "Playing",
                 "keep_playing": keep_playing}
     if pending is None:
