@@ -100,6 +100,47 @@ _spotify_access: tuple[float, str] = (0.0, "")   # (expires_at, token)
 # generation prompts. See strip_names().
 _last_heard: list[str] = []
 
+# ─── track library ──────────────────────────────────────────────────────────
+# Every generated track already lives in tracks/ — this is the index that makes
+# them findable again, instead of orphaned files nobody can reach.
+INDEX_FILE = TRACKS / "index.json"
+
+
+def library() -> list[dict]:
+    if not INDEX_FILE.exists():
+        return []
+    try:
+        return json.loads(INDEX_FILE.read_text())
+    except Exception as exc:      # a corrupt index must not break generation
+        print(f"track index unreadable, starting fresh: {exc}")
+        return []
+
+
+def remember(file: str, prompt: str, genre: str, label: str) -> None:
+    entries = library()
+    entries.insert(0, {"file": file, "prompt": prompt, "genre": genre.lower(),
+                       "label": label, "created": int(time.time()), "plays": 1})
+    INDEX_FILE.write_text(json.dumps(entries[:200], indent=1))
+
+
+def find_in_library(want: str) -> dict | None:
+    """Best existing track for a genre or description, or None.
+
+    Generation costs 15 seconds and real money; if we already made something
+    that fits, playing it back beats making a near-duplicate.
+    """
+    want = want.lower().strip()
+    if not want:
+        return None
+    for entry in library():                      # newest first
+        if want in entry["genre"] or want in entry["label"].lower():
+            return entry
+    words = {w for w in want.split() if len(w) > 3}
+    for entry in library():
+        if words & set(entry["prompt"].lower().split()):
+            return entry
+    return None
+
 claude = anthropic.Anthropic()
 
 # Mounted on the same app so there is one process, one port, one firewall rule.
@@ -117,6 +158,8 @@ class TrackSpec(BaseModel):
     prompt: str          # the music description sent to ElevenLabs
     duration_ms: int
     instrumental: bool
+    genre: str = ""      # short tag for the library
+    label: str = ""      # human name, mirrors Plan.screen
 
 
 class Ambient(BaseModel):
@@ -134,10 +177,13 @@ class Plan(BaseModel):
     # "quieter" is ambiguous — playback volume, or calmer music? Deciding this
     # is the whole job. Getting it wrong is what makes the device feel broken.
     intent: Literal["set_volume", "modify_track", "new_track", "transport",
-                    "spotify_play", "answer"]
+                    "spotify_play", "answer", "replay", "keep_playing"]
     volume: float | None   # absolute target 0..1, only for set_volume
     track: TrackSpec | None  # only for modify_track / new_track
     spotify_query: str | None  # search terms, only for spotify_play
+    genre: str | None          # short tag for the library, e.g. "lo-fi hip hop"
+    replay_query: str | None   # what to look for in the library, only for replay
+    keep_playing: bool | None  # only for keep_playing: True = on, False = off
     # only for transport: what to actually do
     transport_action: Literal["pause", "resume", "next", "previous"] | None
     say: str               # spoken/《logged》 reply, covers generation latency
@@ -167,10 +213,28 @@ Choosing the intent is the most important thing you do:
   for genres or moods; "play some jazz" is new_track, because they want music
   like that, not one specific recording.
 
+  This also covers a song the user can only half-describe: quoted lyrics, a
+  hummed hook they put into words, "that one by Dave about running". You know an
+  enormous amount of popular music — work out what they mean and put the actual
+  title and artist in `spotify_query`, not the lyrics. "the one that goes is this
+  the real life" becomes "Bohemian Rhapsody Queen". If you genuinely cannot place
+  it, put the best search terms you can and say in `say` that you are guessing.
+
+- replay: the user wants something they have heard before — "play that again",
+  "the lo-fi one from earlier", "put that jazz track back on". Set
+  `replay_query` to what to look for: a genre, a mood, or "" for the most
+  recent. Nothing is generated, so this is instant and free.
+- keep_playing: "keep playing", "keep it going", "don't stop", "autoplay" turns
+  it ON (`keep_playing` true); "stop after this", "just this one" turns it OFF.
+  When on, a new track is made automatically as each one ends.
 - answer: a QUESTION that needs no action — "what is this song?", "who sings
   this?", "what's playing?", "what can you do?". Put the reply in `say` and
   change nothing. A question is never a request to play something: "what is this
   song" must not restart it.
+
+  Only for actual questions. A command is not a question: "skip this" is
+  transport, "play that again" is replay. If the user is telling you to do
+  something, do it.
 
 Deciding between new_track and spotify_play is the second most important call you
 make. A named song or artist is spotify_play. A description is new_track. A
@@ -216,6 +280,12 @@ London. When it is absent, do not speculate about the room or the season.
 Even when you have it, never read the readings aloud in `say`. "Something warm
 for the evening" is good; "it is 19°C and dim so here is jazz" is not — nobody
 wants their thermostat narrating.
+
+On every new_track and modify_track, also set `track.genre` to a SHORT tag —
+"lo-fi hip hop", "drum and bass", "ambient", "flamenco" — two or three words, no
+punctuation. It is what makes the track findable later, and what stops us
+generating a near-duplicate of something we already have. Set `track.label` to
+the same text as `screen`.
 
 `duration_ms` must be 120000.
 
@@ -270,6 +340,9 @@ now_playing: str = ""
 # whole generation in silence. One worker: one device, one track at a time.
 _pool = ThreadPoolExecutor(max_workers=1)
 pending: Future | None = None
+# When on, a fresh track is queued the moment one is handed over, so the next is
+# already generating while the current plays and the room never goes quiet.
+keep_playing: bool = False
 
 # Last reading from the sensor board, and when it arrived. Stale readings are
 # worse than none — a temperature from this morning is a lie about right now.
@@ -508,6 +581,7 @@ def generate(spec: TrackSpec) -> str:
 
     name = f"track_{int(time.time())}.mp3"
     (TRACKS / name).write_bytes(r.content)
+    remember(name, prompt, spec.genre or "", spec.label or "")
     print(f"generated {name} in {time.monotonic() - started:.1f}s "
           f"({len(r.content) // 1024}KB) :: {spec.prompt}")
     return name
@@ -591,6 +665,54 @@ def generate_music(prompt: str, duration_seconds: int = 120,
     # Remembered so a follow-up like "make it calmer" has something to adjust.
     current_track = spec
     return url
+
+
+@app.get("/history")
+def history(limit: int = 30):
+    """Everything generated so far, newest first."""
+    return {"tracks": [{**e, "url": f"{PUBLIC_URL}/tracks/{e['file']}"}
+                       for e in library()[:limit]]}
+
+
+@mcp.tool
+def list_library(limit: int = 20) -> str:
+    """Tracks already generated, newest first, with their genres.
+
+    Check here before generating: if something close already exists, replaying it
+    is instant and free, while generating a near-duplicate costs 15 seconds and
+    real money. Use play_from_library to play one.
+    """
+    entries = library()[:limit]
+    if not entries:
+        return "Nothing generated yet."
+    return "\n".join(
+        f"{i}. {e['label'] or e['genre'] or 'untitled'} [{e['genre']}] — {e['prompt'][:70]}"
+        for i, e in enumerate(entries))
+
+
+@mcp.tool
+def play_from_library(query: str = "") -> str:
+    """URL of an already-generated track matching a genre or description.
+
+    Empty query returns the most recent. Returns "" if nothing matches, in which
+    case generate something instead.
+    """
+    hit = find_in_library(query) or (library()[0] if not query and library() else None)
+    if not hit:
+        return ""
+    return f"{PUBLIC_URL}/tracks/{hit['file']}"
+
+
+@mcp.tool
+def set_keep_playing(on: bool) -> str:
+    """Turn continuous play on or off.
+
+    When on, a new track is generated as each one is handed over, so playback
+    never stops. The device keeps asking for the next track by itself.
+    """
+    global keep_playing
+    keep_playing = on
+    return f"Keep playing is {'on' if on else 'off'}."
 
 
 @mcp.tool
@@ -690,6 +812,23 @@ async def utterance(request: Request, volume_now: float | None = None):
     # this device — so the only thing to return is a spoken account of what
     # happened, including when it could not.
     spoken = plan.say
+
+    # Replay costs nothing and takes no time — hand the file straight back.
+    replayed = None
+    if plan.intent == "replay":
+        hit = find_in_library(plan.replay_query or "")
+        if hit:
+            replayed = f"{base}/tracks/{hit['file']}"
+            screen = (hit["label"] or plan.screen)[:20]
+            print(f"replay: {hit['file']} ({hit['genre']})")
+        else:
+            spoken = "I could not find that one. Want me to make something new?"
+
+    if plan.intent == "keep_playing" and plan.keep_playing is not None:
+        global keep_playing
+        keep_playing = plan.keep_playing
+        print(f"keep playing: {'on' if keep_playing else 'off'}")
+
     if plan.intent == "transport" and plan.transport_action:
         result = spotify_control(plan.transport_action)
         print(f"transport {plan.transport_action} -> {result}")
@@ -713,6 +852,9 @@ async def utterance(request: Request, volume_now: float | None = None):
         "screen": plan.screen[:20],
         "music": music,
         "speech_url": speech_url,
+        # Replay has audio ready immediately, so the device can skip /track.
+        "replay_url": replayed,
+        "keep_playing": keep_playing,
         # True means: play the speech, then GET /track for the music.
         "music_pending": generating,
         "audio_url": None,
@@ -901,6 +1043,7 @@ def track(request: Request):
     if pending is None:
         return {"audio_url": None, "screen": "Nothing queued"}
 
+    global keep_playing
     try:
         name = pending.result(timeout=GENERATION_TIMEOUT)
     except Exception as exc:
@@ -909,10 +1052,17 @@ def track(request: Request):
     finally:
         pending = None
 
-    # Hand back the label the spoken reply already used, so the screen names the
-    # music rather than restating that something is playing.
+    # Queue the follow-up now, so it generates while this one plays. By the time
+    # the device asks again it is usually already waiting.
+    if keep_playing and current_track is not None:
+        nxt = current_track
+        pending = _pool.submit(lambda: generate(nxt))
+        print("keep playing: next track queued")
+
     return {"audio_url": f"{str(request.base_url).rstrip('/')}/tracks/{name}",
-            "screen": now_playing or "Playing"}
+            "screen": now_playing or "Playing",
+            # Device: when this finishes, come back to /track instead of idling.
+            "keep_playing": keep_playing}
 
 
 if __name__ == "__main__":
@@ -920,19 +1070,19 @@ if __name__ == "__main__":
     chill = TrackSpec(prompt="chill lo-fi", duration_ms=30000, instrumental=True)
 
     t, v, gen = apply(
-        Plan(intent="new_track", volume=None, track=chill, spotify_query=None, transport_action=None, say="", screen=""),
+        Plan(intent="new_track", volume=None, track=chill, spotify_query=None, transport_action=None, genre=None, replay_query=None, keep_playing=None, say="", screen=""),
         None, 0.6)
     assert gen and t == chill
 
     warmer = chill.model_copy(update={"prompt": "chill lo-fi, warmer"})
     t2, _, gen2 = apply(
-        Plan(intent="modify_track", volume=None, track=warmer, spotify_query=None, transport_action=None, say="", screen=""),
+        Plan(intent="modify_track", volume=None, track=warmer, spotify_query=None, transport_action=None, genre=None, replay_query=None, keep_playing=None, say="", screen=""),
         t, v)
     assert gen2 and t2.prompt.endswith("warmer")
 
     # volume never generates, and is clamped
     _, v3, gen3 = apply(
-        Plan(intent="set_volume", volume=1.9, track=None, spotify_query=None, transport_action=None, say="", screen=""),
+        Plan(intent="set_volume", volume=1.9, track=None, spotify_query=None, transport_action=None, genre=None, replay_query=None, keep_playing=None, say="", screen=""),
         t2, v)
     assert not gen3 and v3 == 1.0
 

@@ -17,3 +17,6 @@ cad/out/
 
 # Spotify OAuth token (refresh token) — never commit
 backend/.spotify_token.json
+
+# generated track index
+backend/tracks/index.json
