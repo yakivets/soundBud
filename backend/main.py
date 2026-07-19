@@ -916,7 +916,13 @@ async def utterance(request: Request, volume_now: float | None = None):
     music = current_track.prompt if needs_generation else None
 
     # Now start the music, so it generates while the reply is being voiced.
-    if needs_generation and GENERATE_AUDIO and pending is None:
+    # A new request always supersedes an unfinished one: the device may never
+    # have collected the last track, and refusing to generate because something
+    # is still pending wedges the whole thing until a restart.
+    if needs_generation and GENERATE_AUDIO:
+        if pending is not None and not pending.done():
+            pending.cancel()      # no-op if it already started; it just goes unused
+            print("superseding the previous, uncollected generation")
         track = current_track
         now_playing = screen
         pending = _pool.submit(lambda: generate(track))
